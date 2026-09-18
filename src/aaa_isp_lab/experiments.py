@@ -8,6 +8,7 @@
 import copy
 import time
 
+import cv2
 import numpy as np
 
 from .config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
@@ -452,3 +453,164 @@ def exp_coupling(scfg, icfg, ae_cfg, awb_cfg, af_cfg, size):
             "clip": float(fr.clipped_ratio),
         })
     return {"rows": rows, "true_focus": true_focus}
+
+
+# -----------------------------------------------------------------------------
+# 12. 画质指标：MTF / 信噪比 / 动态范围 / 阴影
+# -----------------------------------------------------------------------------
+def exp_image_quality(scfg, icfg, size, af_cfg):
+    """画质调优用的标准测量：每一项都先自检再使用。
+
+    这一节的存在意义：前面所有实验都是"仿真内部"的对比（哪个算法更好），
+    这一节回答的是**产品规格书上的那些数字**——MTF50 多少、SNR 多少、
+    动态范围几档、色阴影几个单位。这些才是"画质调优"的通用语言。
+    """
+    from .eval import image_quality as IQ
+
+    out = {}
+
+    # --- (a) 斜边法 MTF 的链路自检：与已知高斯 PSF 的解析解对比 ---
+    rows = []
+    curve_sigma = 1.0
+    for sg in (0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 4.0):
+        img = IQ.synthetic_slanted_edge(240, 200, sg, angle_deg=5.0)
+        r = IQ.slanted_edge_mtf(img)
+        th = IQ.gaussian_mtf_theory(r.freqs, sg, pixel_aperture=True)
+        f_fine = np.linspace(0.0, 0.5, 4001)
+        th_fine = IQ.gaussian_mtf_theory(f_fine, sg, pixel_aperture=True)
+        idx = np.where(th_fine < 0.5)[0]
+        mtf50_th = float(f_fine[idx[0]]) if idx.size else float("nan")
+        rows.append({
+            "sigma": float(sg), "angle": float(r.edge_angle_deg),
+            "mtf50": float(r.mtf50), "mtf50_theory": mtf50_th,
+            "dev_pct": float((r.mtf50 / mtf50_th - 1.0) * 100.0),
+            "curve_err": float(np.max(np.abs(r.mtf - th))),
+        })
+        if abs(sg - curve_sigma) < 1e-9:
+            out["_curve"] = {"freqs": r.freqs.tolist(), "mtf": r.mtf.tolist(),
+                             "theory": th.tolist(), "sigma": float(sg)}
+    out["mtf_selfcheck"] = {"rows": rows,
+                            "max_dev_pct": float(max(abs(r["dev_pct"]) for r in rows)),
+                            "max_curve_err": float(max(r["curve_err"] for r in rows))}
+
+    # --- (b) 仿真相机的 MTF50 vs 镜头位置（与 AF 评价函数对照）---
+    # 在**线性域**测：显示链路（色调曲线 + USM 锐化）会改变边缘形状，
+    # 拿显示图测出来的不是成像系统的 MTF，而是"成像 + 后期"的合成结果。
+    # 这里同时把两条都测出来，正好量化锐化对 MTF 数字的影响。
+    sc_edge = SC.slanted_edge_target(size[0], size[1], angle_deg=5.0, supersample=4)
+    positions = np.linspace(0.0, 1.0, 17)
+    mtf50_lin, mtf50_disp, tenengrads = [], [], []
+    for p_ in positions:
+        cam = make_camera(sc_edge, 5000.0, scfg, icfg, seed=61,
+                          true_focus=0.35, max_blur_px=af_cfg.max_blur_px)
+        fr = cam.capture(ev=0.0, focus_pos=float(p_))
+        try:
+            mtf50_lin.append(float(IQ.slanted_edge_mtf(fr.linear_pre_wb[..., 1]).mtf50))
+        except Exception:
+            mtf50_lin.append(float("nan"))
+        try:
+            mtf50_disp.append(float(IQ.slanted_edge_mtf(fr.srgb_u8[..., 1]).mtf50))
+        except Exception:
+            mtf50_disp.append(float("nan"))
+        tenengrads.append(float(AF.focus_measure(fr.linear_pre_wb[..., 1],
+                                                 "tenengrad", "center", 0.5)))
+    out["mtf_vs_focus"] = {"positions": positions.tolist(), "mtf50": mtf50_lin,
+                           "mtf50_display": mtf50_disp, "tenengrad": tenengrads,
+                           "true_focus": 0.35}
+
+    # --- (c) 噪声曲线与光子转换曲线（在 RAW 上分通道测量）---
+    sc_flat = SC.uniform_scene(size[0], size[1], level=0.6)
+    scfg_flat = SensorConfig(width=scfg.width, height=scfg.height,
+                             vignetting_strength=0.0)   # 关阴影，隔离噪声
+    patch = (size[1] // 2 - 20, size[1] // 2 + 20,
+             size[0] // 2 - 20, size[0] // 2 + 20)
+    pts = []
+    for ev in np.linspace(-9.0, 0.5, 20):
+        acc_m, acc_v = 0.0, 0.0
+        reps = 4
+        for seed in range(reps):
+            cam = make_camera(sc_flat, 5000.0, scfg_flat, icfg, seed=200 + seed)
+            fr = cam.capture(ev=float(ev))
+            g = IQ.patch_channel_stats(fr.raw_dn, patch, cam.isp.pattern,
+                                       scfg_flat.black_level_dn)["G"]
+            acc_m += g.mean_dn
+            acc_v += g.std_dn ** 2
+        pts.append(IQ.NoisePoint(acc_m / reps, float(np.sqrt(acc_v / reps)), reps))
+    ptc = IQ.fit_photon_transfer(pts, saturation_dn=scfg_flat.signal_dn)
+    k_true = scfg_flat.full_well_e / scfg_flat.signal_dn
+    out["noise"] = {
+        "points": [{"mean": p.mean_dn, "std": p.std_dn, "snr_db": p.snr_db}
+                   for p in pts],
+        "gain": {"measured": ptc.gain_e_per_dn, "true": k_true,
+                 "dev_pct": (ptc.gain_e_per_dn / k_true - 1.0) * 100.0},
+        "read_noise": {"measured": ptc.read_noise_e, "true": scfg_flat.read_noise_e,
+                       "dev_pct": (ptc.read_noise_e / scfg_flat.read_noise_e - 1.0) * 100.0},
+        "r2": ptc.r2, "n_points": ptc.n_points,
+    }
+
+    # --- (d) 暗噪声 vs 增益：提高增益到底改善了什么 ---
+    # 直接拍**全黑帧**测噪声底（"暗噪声"的标准测法）。
+    # 前两版分别用"两种曝光策略的 SNR"和"逐增益拟合 PTC 截距"，
+    # 都不行：前者被硬件上限钳到同一点，后者的截距在方差里占比太小、
+    # 被拟合噪声淹没（甚至拟合出负截距）。
+    #
+    # 位深提到 14bit：12bit 时量化噪声 1/12 DN² 折算到输入端约 0.86 e-，
+    # 会盖过读出噪声（1.8 e-）随增益下降到 0.11 e- 的过程，
+    # 把要观察的效应整个埋掉 —— 这是真实 ISP 里也会遇到的测量条件问题。
+    dark = SC.dim(sc_flat, 0.0, "black")
+    rows = []
+    for model in ("iso_less", "gain_referred"):
+        for g in (1, 2, 4, 8, 16):
+            cfg_g = SensorConfig(width=scfg.width, height=scfg.height,
+                                 vignetting_strength=0.0, read_noise_model=model,
+                                 max_analog_gain=float(g), bit_depth=14)
+            ae_g = AEConfig(priority="gain_priority")
+            k_g = cfg_g.full_well_e / cfg_g.signal_dn
+            sig_dn = []
+            for seed in range(6):
+                cam = make_camera(dark, 5000.0, cfg_g, icfg, seed=500 + seed)
+                fr = cam.capture(ev=float(np.log2(g)), ae_cfg=ae_g)
+                st = IQ.patch_channel_stats(fr.raw_dn, patch, cam.isp.pattern,
+                                            cfg_g.black_level_dn)["G"]
+                sig_dn.append(st.std_dn)
+            sigma_dn = float(np.mean(sig_dn))
+            sigma_e = sigma_dn * k_g            # 折算到输入端电子数
+            s_e = 2.0
+            snr_low = 20.0 * np.log10(s_e / np.sqrt(s_e + sigma_e ** 2))
+            rows.append({"model": model, "gain": float(g),
+                         "read_noise_dn": sigma_dn,
+                         "read_noise_e": float(sigma_e),
+                         "snr_at_2e_db": float(snr_low)})
+    out["gain_vs_noise"] = {"rows": rows,
+                            "k_true": float(scfg.full_well_e / scfg.signal_dn)}
+
+    # --- (e) 动态范围 ---
+    dr_meas = IQ.dynamic_range_db(scfg_flat.signal_dn,
+                                  scfg_flat.read_noise_e / k_true)
+    out["dynamic_range"] = {
+        "measured_db": float(dr_meas),
+        "theory_db": float(IQ.sensor_dr_theory_db(scfg_flat.full_well_e,
+                                                  scfg_flat.read_noise_e)),
+        "stops": float(dr_meas / 6.02),
+        "full_well_e": scfg_flat.full_well_e,
+        "read_noise_e": scfg_flat.read_noise_e,
+        "bit_depth": scfg_flat.bit_depth,
+    }
+
+    # --- (f) 阴影：亮度均匀度与色阴影（LSC 校正准 / 欠 / 过）---
+    sc_u = SC.uniform_scene(size[0], size[1])
+    rows = []
+    for lsc_model, enable, label in (("ideal", False, "无 LSC"),
+                                     ("radial2", True, "LSC 欠校正(0.7×)"),
+                                     ("ideal", True, "LSC 正确"),
+                                     ("radial2_over", True, "LSC 过校正(1.25×)")):
+        cam = make_camera(sc_u, 5000.0, scfg, icfg, seed=71,
+                          lsc_model=lsc_model, enable_lsc=enable)
+        fr = cam.capture(ev=0.0, wb_gains=ideal_gains(5000.0))
+        m = IQ.shading_metrics(fr.linear_pre_wb)
+        rows.append({"label": label,
+                     "luma_uniformity": m["luma_uniformity"],
+                     "d_uv_corner_max": m["d_uv_corner_max"]})
+    out["shading"] = {"rows": rows}
+
+    return out

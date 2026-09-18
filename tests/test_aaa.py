@@ -29,6 +29,7 @@ from aaa_isp_lab.sim.optics import defocus_kernel
 from aaa_isp_lab.aaa.ae import AEController, metering_metric
 from aaa_isp_lab.aaa.awb import AWBEstimator, ideal_gains, illuminant_error_deg
 from aaa_isp_lab.aaa import af as AF
+from aaa_isp_lab.eval import image_quality as IQ
 
 W, H = 192, 144
 SCFG = SensorConfig(width=W, height=H)
@@ -383,6 +384,159 @@ def test_ideal_linear_is_reference():
         ideal = ideal_linear(sc, temp)
         ratio = ideal[sc.neutral_mask] / np.maximum(sc.reflectance[sc.neutral_mask], 1e-6)
         assert np.allclose(ratio, ratio[0, 0], rtol=1e-4), "中性区的比例常数必须一致"
+
+
+# -----------------------------------------------------------------------------
+# 4. 画质指标测量（每一项都要能和真值对上）
+# -----------------------------------------------------------------------------
+@case
+def test_mtf_recovers_known_psf():
+    """斜边法 MTF 必须能还原已知高斯 PSF 的解析解。
+
+    这条测试是这一组测量可信度的基础：如果 MTF 测不准，
+    报告里所有"清晰度"相关的数字都是废的。
+    """
+    for sigma in (0.7, 1.0, 1.5, 3.0):
+        img = IQ.synthetic_slanted_edge(200, 160, sigma, angle_deg=5.0)
+        r = IQ.slanted_edge_mtf(img)
+        f_fine = np.linspace(0.0, 0.5, 4001)
+        th_fine = IQ.gaussian_mtf_theory(f_fine, sigma, pixel_aperture=True)
+        idx = np.where(th_fine < 0.5)[0]
+        mtf50_th = float(f_fine[idx[0]])
+        dev = abs(r.mtf50 / mtf50_th - 1.0)
+        assert dev < 0.08, f"σ={sigma}: MTF50 {r.mtf50:.3f} vs 理论 {mtf50_th:.3f}（偏差 {dev:.1%}）"
+        th = IQ.gaussian_mtf_theory(r.freqs, sigma, pixel_aperture=True)
+        assert np.max(np.abs(r.mtf - th)) < 0.06, f"σ={sigma}: MTF 曲线偏差过大"
+        # 边缘角度也要能测出来（斜边法的前提）
+        assert abs(r.edge_angle_deg - 5.0) < 0.3, f"测出的边缘角度 {r.edge_angle_deg:.2f}°"
+
+
+@case
+def test_mtf_monotone_in_blur():
+    """模糊越大 MTF50 越小（单调性）。反了说明测量链路有问题。"""
+    vals = [IQ.slanted_edge_mtf(
+        IQ.synthetic_slanted_edge(200, 160, sg, angle_deg=5.0)).mtf50
+        for sg in (0.5, 1.0, 2.0, 4.0)]
+    assert all(vals[i] > vals[i + 1] for i in range(len(vals) - 1)), vals
+
+
+@case
+def test_photon_transfer_recovers_sensor():
+    """光子转换曲线必须把仿真的转换增益与读出噪声反推回来。"""
+    cfg = SensorConfig(width=256, height=192, vignetting_strength=0.0)
+    sc = SC.uniform_scene(256, 192, level=0.6)
+    patch = (100, 140, 140, 180)
+    pts = []
+    for ev in np.linspace(-8.0, 0.5, 12):
+        acc_m, acc_v = 0.0, 0.0
+        reps = 3
+        for seed in range(reps):
+            cam = SimCamera(sc, 5000.0, cfg, ICFG, seed=700 + seed)
+            fr = cam.capture(ev=float(ev))
+            g = IQ.patch_channel_stats(fr.raw_dn, patch, cam.isp.pattern,
+                                       cfg.black_level_dn)["G"]
+            acc_m += g.mean_dn
+            acc_v += g.std_dn ** 2
+        pts.append(IQ.NoisePoint(acc_m / reps, float(np.sqrt(acc_v / reps)), reps))
+
+    fit = IQ.fit_photon_transfer(pts, saturation_dn=cfg.signal_dn)
+    k_true = cfg.full_well_e / cfg.signal_dn
+    assert abs(fit.gain_e_per_dn / k_true - 1.0) < 0.05,         f"转换增益 K 偏差过大: {fit.gain_e_per_dn:.4f} vs {k_true:.4f}"
+    # 12 个点、每点 3 帧平均，R² 到 0.999 量级即可（阈值定太死会变成
+    # 在测随机数，测试本身反而变脆）
+    assert fit.r2 > 0.995, f"拟合优度过低: {fit.r2}"
+    # 读出噪声会叠加量化噪声，允许较宽的容差
+    assert abs(fit.read_noise_e - cfg.read_noise_e) < 0.6,         f"读出噪声 {fit.read_noise_e:.3f} e- vs 真值 {cfg.read_noise_e}"
+
+
+@case
+def test_ptc_must_reject_saturated_points():
+    """饱和点必须剔除：含着它拟合会把转换增益反推得明显偏大。
+
+    这是本项目实测到的坑（不剔除时 K 被反推成真值的 1.5 倍），
+    所以专门加一条测试把它钉住。
+    """
+    cfg = SensorConfig(width=256, height=192, vignetting_strength=0.0)
+    sc = SC.uniform_scene(256, 192, level=0.6)
+    patch = (100, 140, 140, 180)
+    pts = []
+    for ev in np.linspace(-4.0, 1.2, 10):     # 故意包含过曝点
+        cam = SimCamera(sc, 5000.0, cfg, ICFG, seed=800)
+        fr = cam.capture(ev=float(ev))
+        g = IQ.patch_channel_stats(fr.raw_dn, patch, cam.isp.pattern,
+                                   cfg.black_level_dn)["G"]
+        pts.append(IQ.NoisePoint(g.mean_dn, g.std_dn, g.n_pixels))
+    k_true = cfg.full_well_e / cfg.signal_dn
+    with_clip = IQ.fit_photon_transfer(pts)
+    without = IQ.fit_photon_transfer(pts, saturation_dn=cfg.signal_dn)
+    err_clip = abs(with_clip.gain_e_per_dn / k_true - 1.0)
+    err_clean = abs(without.gain_e_per_dn / k_true - 1.0)
+    assert err_clean < 0.05, f"剔除饱和点后 K 仍偏 {err_clean:.1%}"
+    assert err_clip > err_clean, "剔除饱和点应当让结果更好"
+
+
+@case
+def test_dynamic_range_formula():
+    cfg = SensorConfig()
+    k = cfg.full_well_e / cfg.signal_dn
+    dr = IQ.dynamic_range_db(cfg.signal_dn, cfg.read_noise_e / k)
+    assert abs(dr - IQ.sensor_dr_theory_db(cfg.full_well_e, cfg.read_noise_e)) < 1e-6
+    # 满阱翻倍 -> +6 dB；读出噪声翻倍 -> -6 dB
+    assert abs(IQ.dynamic_range_db(2 * cfg.signal_dn, cfg.read_noise_e / k) - dr - 6.02) < 0.1
+    assert abs(IQ.dynamic_range_db(cfg.signal_dn, 2 * cfg.read_noise_e / k) - dr + 6.02) < 0.1
+
+
+@case
+def test_shading_metrics():
+    """均匀图：均匀度 1、色阴影 0；带阴影的图：均匀度明显小于 1"""
+    flat = np.full((120, 160, 3), 0.5, dtype=np.float32)
+    m = IQ.shading_metrics(flat)
+    assert abs(m["luma_uniformity"] - 1.0) < 1e-3, m
+    assert m["d_uv_corner_max"] < 0.5, m
+
+    from aaa_isp_lab.sim import optics
+    vig = optics.apply_vignetting(flat, strength=0.5)
+    m2 = IQ.shading_metrics(vig)
+    assert m2["luma_uniformity"] < 0.75, m2
+    # 镜头阴影本身是**分通道**衰减（三个通道衰减量不同），所以亮度阴影
+    # 必然带出色阴影 —— 这正是 LSC 必须按 CFA 通道分别补偿的原因。
+    # 一开始这条断言写成"纯亮度阴影不该有色阴影"，把模型的设计意图搞反了。
+    assert m2["d_uv_corner_max"] > 1.0, m2
+
+    # 反例：只有亮度衰减、三通道完全一致的阴影，不应产生色阴影
+    gray_vig = vig.mean(axis=2, keepdims=True) * np.ones(3, dtype=np.float32)
+    m3 = IQ.shading_metrics(gray_vig)
+    assert m3["luma_uniformity"] < 0.75
+    assert m3["d_uv_corner_max"] < 0.5, m3
+
+
+@case
+def test_gain_referred_model_lowers_dark_noise():
+    """读出噪声后置的模型下，提高增益必须压低暗噪声折算值。
+
+    这是"ISO 存在的意义"的量化证据，也是前面"增益不改善 SNR"说法的边界。
+    """
+    flat = SC.uniform_scene(192, 144, level=0.5)
+    dark = SC.dim(flat, 0.0, "black")
+    patch = (60, 84, 84, 108)
+    noise = {}
+    for model in ("iso_less", "gain_referred"):
+        vals = []
+        for g in (1, 16):
+            cfg = SensorConfig(width=192, height=144, vignetting_strength=0.0,
+                               read_noise_model=model, max_analog_gain=float(g),
+                               bit_depth=14)
+            cam = SimCamera(dark, 5000.0, cfg, ICFG, seed=900)
+            fr = cam.capture(ev=float(np.log2(g)), ae_cfg=AEConfig(priority="gain_priority"))
+            st = IQ.patch_channel_stats(fr.raw_dn, patch, cam.isp.pattern,
+                                        cfg.black_level_dn)["G"]
+            vals.append(st.std_dn * (cfg.full_well_e / cfg.signal_dn))
+        noise[model] = vals
+    # ISO 无关：高低增益的暗噪声折算值基本一样
+    assert abs(noise["iso_less"][1] / noise["iso_less"][0] - 1.0) < 0.15, noise["iso_less"]
+    # 读出噪声后置：16× 增益下暗噪声折算值必须明显下降
+    assert noise["gain_referred"][1] < 0.7 * noise["gain_referred"][0], noise["gain_referred"]
+
 
 
 def run_all():

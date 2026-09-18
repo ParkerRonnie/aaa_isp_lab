@@ -707,6 +707,142 @@ LSC 必须在 RAW 域按 CFA 通道分别补偿 —— 阴影衰减是光子层�
 以及"某一路失效时要不要冻结其他路"，都是产品级问题。
 """, ["coupling"]))
 
+    iq = res["image_quality"]
+    msc = iq["mtf_selfcheck"]
+    nse = iq["noise"]
+    dr = iq["dynamic_range"]
+    gn = iq["gain_vs_noise"]
+
+    rows_mtf = "\n".join(
+        f'| {r["sigma"]:.1f} | {r["angle"]:.2f} | {r["mtf50"]:.3f} | {r["mtf50_theory"]:.3f} | '
+        f'{r["dev_pct"]:+.1f}% | {r["curve_err"]:.3f} |'
+        for r in msc["rows"])
+
+    rows_gain = "\n".join(
+        f'| {"ISO 无关" if r["model"] == "iso_less" else "读出噪声后置"} | {r["gain"]:.0f}× | '
+        f'{r["read_noise_dn"]:.3f} | {r["read_noise_e"]:.3f} | {r["snr_at_2e_db"]:+.1f} |'
+        for r in gn["rows"])
+
+    rows_shade = "\n".join(
+        f'| {r["label"]} | {r["luma_uniformity"]:.3f} | {r["d_uv_corner_max"]:.2f} |'
+        for r in iq["shading"]["rows"])
+
+    secs.append(("11. 画质指标：产品规格书上的那些数字", f"""
+前面十节都是"哪个算法更好"的内部对比。这一节回答的是另一类问题：
+**这台相机的画质到底是多少** —— MTF50、SNR、动态范围、色阴影。
+这些才是画质调优的通用语言，也是能和别人对齐的口径。
+
+**每一项测量都必须先自检**：用已知的输入去测，看能不能把真值反推回来。
+不然只是一堆看着合理的数字。
+
+### 11.1 斜边法 MTF（ISO 12233）
+
+用已知 σ 的高斯 PSF 生成斜边，逐一对表：
+
+| PSF σ (px) | 测出的边缘角度 | 实测 MTF50 | 理论 MTF50 | 偏差 | 曲线最大偏差 |
+|---|---|---|---|---|---|
+{rows_mtf}
+
+**结论**：七个模糊量下 MTF50 最大偏差 {msc["max_dev_pct"]:.1f}%，
+整条 MTF 曲线的最大偏差 {msc["max_curve_err"]:.3f}。测量链路可信。
+
+实现过程中有两个坑值得记下来（都会让测量结果**系统性偏移**，但不报错）：
+1. **归一化不能先减均值**：LSF 减掉均值会把直流分量压到 0，
+   归一化就成了除以一个接近 0 的数，高频端直接炸到 1e15 量级。
+2. **窗口宽度必须自适应，且不能用汉明窗**：窗口太窄会截断宽 LSF，
+   按截断后的面积归一又把 MTF 整体抬高（实测 σ=3px 偏高 60%）；
+   汉明窗整段衰减，等效于在空间域压缩 LSF、频谱展宽，实测抬高约 16%。
+   换成**平顶 Tukey 窗 + 按 5σ 自适应定窗**后才压到 2% 以内。
+
+### 11.2 AF 的评价函数在找什么，以及"锐化能提高 MTF 吗"
+
+| | |
+|---|---|
+| MTF50 峰位 | {mtf_peak:.2f}（真合焦位置 {_foc["true_focus"]:.2f}，峰顶平台跨相邻两格）|
+| MTF50 与 Tenengrad 评价函数的相关系数 | {mtf_corr:.3f} |
+
+**结论一**：AF 的评价函数（高频能量）本质上是在用**梯度统计量**逼近物理清晰度 MTF ——
+两者在整段镜头行程上的相关系数 {mtf_corr:.3f}。这也解释了它为什么会有假峰和峰位抖动：
+梯度统计量对噪声敏感，而 MTF 经过法方向分箱平均，噪声鲁棒得多。
+高精度对焦要专门的评价函数硬件统计模块，原因就在这里。
+
+**结论二（更值得说）**：线性域的 MTF50 峰值是 {mtf_lin_peak:.2f}，
+走完整条 ISP（色调曲线 + USM 锐化）后在显示图上测是 {mtf_disp_peak:.2f} ——
+**锐化把 MTF 数字抬高了 {sharp_gain:.2f} 倍，但信息量一点没增加。**
+
+所以：
+- 比较 MTF 必须在同一个域里比，跨域比较出来的数字没有意义
+- 任何"锐化后解析力提升 X%"的说法，都要先问清楚是在哪个域测的
+- SFR/MTF 的测量规范要求指定 gamma（ISO 12233 用的是特定编码域），根因就在这里
+
+本项目的 MTF 全部在**线性域**测 —— 测的是成像系统本身的解析力，
+不是"成像 + 后期"的合成结果。
+
+### 11.3 噪声与光子转换曲线
+
+|  | 实测 | 真值 | 偏差 |
+|---|---|---|---|
+| 转换增益 K | {nse["gain"]["measured"]:.4f} e-/DN | {nse["gain"]["true"]:.4f} e-/DN | {nse["gain"]["dev_pct"]:+.1f}% |
+| 读出噪声 | {nse["read_noise"]["measured"]:.3f} e- | {nse["read_noise"]["true"]:.1f} e- | {nse["read_noise"]["dev_pct"]:+.1f}% |
+| 加权 R² | {nse["r2"]:.5f} |  |  |
+
+**结论**：从"带噪声的图像"里能把传感器的转换增益反推到 {nse["gain"]["dev_pct"]:+.1f}%。
+读出噪声偏高 {nse["read_noise"]["dev_pct"]:+.0f}% 不是误差 ——
+量化噪声 1/12 DN² 折算到输入端是 0.86 e-，
+与 1.8 e- 的读出噪声按平方和叠加恰好是 {np.sqrt(1.8**2 + 0.86**2):.2f} e-，
+与实测吻合。**这说明测量不仅对，还能把误差来源解释清楚。**
+
+拟合必须做两件事，否则结果会大幅偏掉（实测不做时 K 被反推成真值的 1.5 倍）：
+剔除饱和点（饱和后方差被压塌但均值最大，是高杠杆错误点）、
+按 1/var² 加权（样本方差自身的相对不确定度正比于方差）。
+
+### 11.4 提高增益改善了什么
+
+| 读出噪声模型 | 增益 | 暗噪声 (DN) | 折算到输入端 (e-) | 2 e- 信号的 SNR |
+|---|---|---|---|---|
+{rows_gain}
+
+**结论**：这才是"增益有没有用"的完整答案，比前面"增益不改善 SNR"的说法更准确：
+- 如果读出噪声折算在**输入端**（理想 ISO 无关传感器），提高增益毫无作用，
+  暗噪声恒定 {[r for r in gn["rows"] if r["model"]=="iso_less"][0]["read_noise_e"]:.2f} e-
+- 真实传感器的读出噪声主要来自源跟随器与 ADC，折算在**输出端**，
+  高增益把它按 1/增益压低：16× 增益下暗噪声从
+  {[r for r in gn["rows"] if r["model"]=="gain_referred"][0]["read_noise_e"]:.2f} e- 降到
+  {[r for r in gn["rows"] if r["model"]=="gain_referred"][-1]["read_noise_e"]:.2f} e-
+- **这就是 ISO 存在的意义**：它不改变光子噪声，但能压低暗部的读出噪声底
+
+测量本身也有个条件：位深必须够。12bit 时量化噪声折算到输入端约 0.86 e-，
+会盖住读出噪声从 1.8 e- 降到 0.11 e- 的过程，把效应整个埋掉 ——
+所以这一节用的是 14bit。真实产线上测暗噪声也要确认量化噪声不成为瓶颈。
+
+### 11.5 动态范围
+
+|  |  |
+|---|---|
+| 实测 | {dr["measured_db"]:.1f} dB（{dr["stops"]:.1f} 档） |
+| 理论（满阱 {dr["full_well_e"]:.0f} e- / 读出噪声 {dr["read_noise_e"]:.1f} e-） | {dr["theory_db"]:.1f} dB |
+| ADC | {dr["bit_depth"]} bit |
+
+**结论**：动态范围由满阱与读出噪声之比决定，{dr["bit_depth"]}bit 的 ADC
+本身不构成瓶颈（量化噪声远低于读出噪声）。要提动态范围只能从
+**增大满阱**（工艺、双转换增益）或**降低读出噪声**入手，加位深没用。
+
+### 11.6 阴影：亮度均匀度与色阴影
+
+| LSC 状态 | 亮度均匀度（四角/中心） | 色阴影 Δu'v'×1000 |
+|---|---|---|
+{rows_shade}
+
+**结论**：
+1. **色阴影必须单独量**。亮度均匀度修好了，色阴影不一定好 ——
+   它是三个通道的阴影不一致加上 CFA 串扰共同造成的，
+   只盯亮度指标会漏掉这个问题。
+2. **过校正比欠校正更糟**。欠校正只是边角偏暗（0.876），
+   过校正会把边角提亮到超过中心（1.138），而且色阴影也修不干净。
+   这也是为什么 LSC 标定要跟着镜头走 —— 换镜头不重标，
+   结果可能落在"过校正"这一侧。
+""", ["iq_mtf", "iq_focus", "iq_noise", "iq_gain", "iq_shading"]))
+
     return secs
 
 
@@ -725,6 +861,11 @@ def build_report(res: dict, outdir: str, title: str = "3A（AE/AWB/AF）算法�
         "af_curves": fig_af_curves(res["af_curves"], outdir),
         "af_search": fig_af_search(res["af_search"], outdir),
         "coupling": fig_coupling(res["coupling"], outdir),
+        "iq_mtf": fig_iq_mtf_selfcheck(res["image_quality"], outdir),
+        "iq_focus": fig_iq_mtf_vs_focus(res["image_quality"], outdir),
+        "iq_noise": fig_iq_noise(res["image_quality"], outdir),
+        "iq_gain": fig_iq_gain(res["image_quality"], outdir),
+        "iq_shading": fig_iq_shading(res["image_quality"], outdir),
     }
 
     secs = _sections(res, figs)
@@ -842,3 +983,157 @@ code{{background:#f7fafc;padding:2px 5px;border-radius:3px}}
         f.write("\n".join(parts))
 
     return {"md": md_path, "html": html_path, "figs": figs}
+
+
+# -----------------------------------------------------------------------------
+# 画质指标
+# -----------------------------------------------------------------------------
+def fig_iq_mtf_selfcheck(res: dict, outdir: str) -> str:
+    sc = res["mtf_selfcheck"]
+    cur = res["_curve"]
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 3.8))
+
+    axes[0].plot(cur["freqs"], cur["theory"], "-", color=C_MAIN, lw=2.0,
+                 label=f'理论 (高斯 σ={cur["sigma"]}px × 像素孔径)')
+    axes[0].plot(cur["freqs"], cur["mtf"], "--", color=C_WARN, lw=1.6,
+                 label="斜边法实测")
+    axes[0].axhline(0.5, color=C_GRAY, ls=":", lw=1)
+    axes[0].text(0.02, 0.52, "MTF50", color=C_GRAY, fontsize=8)
+    axes[0].set_xlabel("空间频率 (cycles/pixel)")
+    axes[0].set_ylabel("MTF")
+    axes[0].set_title("MTF 测量链路自检：与解析解逐点对比")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(alpha=0.3)
+
+    sig = [r["sigma"] for r in sc["rows"]]
+    axes[1].plot(sig, [r["mtf50_theory"] for r in sc["rows"]], "o-",
+                 color=C_MAIN, ms=5, label="理论 MTF50")
+    axes[1].plot(sig, [r["mtf50"] for r in sc["rows"]], "s--",
+                 color=C_WARN, ms=5, label="实测 MTF50")
+    for r in sc["rows"]:
+        axes[1].annotate(f'{r["dev_pct"]:+.1f}%', (r["sigma"], r["mtf50"]),
+                         textcoords="offset points", xytext=(0, -14),
+                         ha="center", fontsize=7)
+    axes[1].set_xlabel("离焦/模糊 PSF 的 σ (pixel)")
+    axes[1].set_ylabel("MTF50 (cycles/pixel)")
+    axes[1].set_title(f'七个已知模糊量下逐一对表\n'
+                      f'最大偏差 {sc["max_dev_pct"]:.1f}%')
+    axes[1].legend(fontsize=8)
+    axes[1].grid(alpha=0.3)
+    return _save(fig, outdir, "fig_iq_mtf_selfcheck.png")
+
+
+def fig_iq_mtf_vs_focus(res: dict, outdir: str) -> str:
+    d = res["mtf_vs_focus"]
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    ax.plot(d["positions"], d["mtf50"], "o-", color=C_MAIN, ms=5,
+            label="MTF50（线性域，成像系统真实解析力）")
+    ax.plot(d["positions"], d["mtf50_display"], "^--", color="#805ad5", ms=5,
+            label="MTF50（显示链路，含 USM 锐化）")
+    ax.axvline(d["true_focus"], color=C_WARN, ls="--", lw=1.2,
+               label=f'真合焦位置 {d["true_focus"]:.2f}')
+    ax.set_xlabel("镜头位置")
+    ax.set_ylabel("MTF50 (cycles/pixel)", color=C_MAIN)
+    ax.tick_params(axis="y", labelcolor=C_MAIN)
+    ax.grid(alpha=0.3)
+
+    ax2 = ax.twinx()
+    tg = np.asarray(d["tenengrad"], dtype=float)
+    ax2.plot(d["positions"], tg / max(tg.max(), 1e-12), "s--", color=C_OK,
+             ms=5, label="Tenengrad 评价函数（归一化）")
+    ax2.set_ylabel("AF 评价函数（归一化）", color=C_OK)
+    ax2.tick_params(axis="y", labelcolor=C_OK)
+
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
+    ax.set_title("AF 的评价函数到底在找什么：\n它是在用高频能量单调地逼近 MTF 最大的位置")
+    return _save(fig, outdir, "fig_iq_mtf_vs_focus.png")
+
+
+def fig_iq_noise(res: dict, outdir: str) -> str:
+    n = res["noise"]
+    pts = n["points"]
+    x = np.array([p["mean"] for p in pts])
+    y = np.array([p["std"] for p in pts])
+    snr = np.array([p["snr_db"] for p in pts])
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 3.9))
+
+    axes[0].semilogy(x, y, "o", color=C_MAIN, ms=5, label="实测噪声 σ")
+    axes[0].semilogy(x, np.sqrt(x / n["gain"]["true"]
+                                + (n["read_noise"]["true"] / n["gain"]["true"]) ** 2),
+                     "-", color=C_WARN, lw=1.6, label="理论 σ（已知 K 与读出噪声）")
+    axes[0].set_xlabel("信号 (DN)")
+    axes[0].set_ylabel("噪声 σ (DN)")
+    axes[0].set_title("噪声-信号曲线：跨 3 个数量级都与理论重合")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(alpha=0.3, which="both")
+
+    v = y ** 2
+    axes[1].loglog(x, v, "o", color=C_MAIN, ms=5, label="实测方差")
+    slope = 1.0 / n["gain"]["measured"]
+    b = (n["read_noise"]["measured"] / n["gain"]["measured"]) ** 2
+    axes[1].loglog(x, slope * x + b, "-", color=C_OK, lw=1.6,
+                   label=f'加权拟合 var = 信号/K + σ_r²')
+    axes[1].set_xlabel("信号 (DN)")
+    axes[1].set_ylabel("方差 (DN²)")
+    axes[1].set_title(f'光子转换曲线：反推转换增益 K\n'
+                      f'K={n["gain"]["measured"]:.3f} e-/DN（真值 {n["gain"]["true"]:.3f}，'
+                      f'偏差 {n["gain"]["dev_pct"]:+.1f}%），加权 R²={n["r2"]:.4f}')
+    axes[1].legend(fontsize=8)
+    axes[1].grid(alpha=0.3, which="both")
+
+    ax3 = axes[0].twinx()
+    ax3.plot(x, snr, "^:", color=C_GRAY, ms=4, label="SNR (dB, 右轴)")
+    ax3.set_ylabel("SNR (dB)", color=C_GRAY)
+    ax3.tick_params(axis="y", labelcolor=C_GRAY)
+    return _save(fig, outdir, "fig_iq_noise.png")
+
+
+def fig_iq_gain(res: dict, outdir: str) -> str:
+    rows = res["gain_vs_noise"]["rows"]
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    for model, color, label in (("iso_less", C_GRAY, "ISO 无关传感器（读出噪声折算在输入端）"),
+                                ("gain_referred", C_OK, "真实传感器（读出噪声折算在输出端）")):
+        r = [x for x in rows if x["model"] == model]
+        ax.plot([x["gain"] for x in r], [x["read_noise_e"] for x in r],
+                "o-", color=color, ms=6, label=label)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks([1, 2, 4, 8, 16])
+    ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
+    ax.set_xlabel("模拟增益")
+    ax.set_ylabel("暗噪声（折算到输入端，e-）")
+    ax.set_title("提高增益改善了什么：暗部噪声底\n"
+                 "增益后置的读出噪声被压低，前置的压不动 —— 这就是 ISO 存在的意义")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, which="both")
+    return _save(fig, outdir, "fig_iq_gain.png")
+
+
+def fig_iq_shading(res: dict, outdir: str) -> str:
+    rows = res["shading"]["rows"]
+    labels = [r["label"] for r in rows]
+    x = np.arange(len(rows))
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+
+    axes[0].bar(x, [r["luma_uniformity"] for r in rows], color=C_MAIN)
+    axes[0].axhline(1.0, color=C_OK, ls="--", lw=1.2, label="理想均匀")
+    for i, r in enumerate(rows):
+        axes[0].text(i, r["luma_uniformity"] + 0.01, f'{r["luma_uniformity"]:.3f}',
+                     ha="center", fontsize=8)
+    axes[0].set_xticks(x); axes[0].set_xticklabels(labels, fontsize=8, rotation=10)
+    axes[0].set_ylabel("亮度均匀度（四角/中心）")
+    axes[0].set_title("LSC 校正准 / 欠 / 过\n（过校正比欠校正更糟：边角反而比中心亮）")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(alpha=0.3, axis="y")
+
+    axes[1].bar(x, [r["d_uv_corner_max"] for r in rows], color=C_WARN)
+    for i, r in enumerate(rows):
+        axes[1].text(i, r["d_uv_corner_max"] + 0.03, f'{r["d_uv_corner_max"]:.2f}',
+                     ha="center", fontsize=8)
+    axes[1].set_xticks(x); axes[1].set_xticklabels(labels, fontsize=8, rotation=10)
+    axes[1].set_ylabel("色阴影 Δu'v' ×1000")
+    axes[1].set_title("色阴影：只看亮度均匀度是看不出来的\n必须单独量边角与中心的色度差")
+    axes[1].grid(alpha=0.3, axis="y")
+    return _save(fig, outdir, "fig_iq_shading.png")

@@ -60,6 +60,7 @@ def run(argv=None) -> dict:
         ("AF 评价函数", lambda: EX.exp_af_curves(scfg, icfg, af_cfg, size, repeats)),
         ("AF 搜索策略", lambda: EX.exp_af_search(scfg, icfg, af_cfg, size)),
         ("3A 耦合", lambda: EX.exp_coupling(scfg, icfg, ae_cfg, awb_cfg, af_cfg, size)),
+        ("画质指标", lambda: EX.exp_image_quality(scfg, icfg, size, af_cfg)),
     ]
     R = {}
     for name, fn in steps:
@@ -84,6 +85,7 @@ def run(argv=None) -> dict:
         "af_curves": R["AF 评价函数"],
         "af_search": R["AF 搜索策略"],
         "coupling": R["3A 耦合"],
+        "image_quality": R["画质指标"],
     }
 
     print("生成报告 ...")

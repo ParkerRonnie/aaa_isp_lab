@@ -223,6 +223,31 @@ def muted_scene(w: int, h: int, dominant_rgb=(0.75, 0.12, 0.10)) -> Scene:
                  note="大面积单色场景：灰世界假设失效，AWB 会明显偏色")
 
 
+def slanted_edge_target(w: int, h: int, angle_deg: float = 5.0,
+                        contrast: float = 0.8, level: float = 0.5,
+                        supersample: int = 8) -> Scene:
+    """斜边靶标（SFR 测试图的标配元素）。
+
+    角度取 5°：斜边法靠"把采样点在边缘法方向上错开"来突破像素间距对
+    频率上限的限制，角度太小错开量不足、太大则有效样本变少。
+    ISO 12233 推荐 5° 左右。
+
+    默认 supersample>1 生成：先在超采样网格上画理想阶跃、再降采样平均，
+    这样才包含**像素孔径**（面积积分）。直接用 np.where 画台阶再点采样，
+    得到的图不含孔径，测出的 MTF 会比真实相机偏高 —— 自测时会误判成
+    测量误差，其实是生成方式不对。
+    """
+    ss = max(1, int(supersample))
+    yy, xx = np.mgrid[0:h * ss, 0:w * ss].astype(np.float64) / ss
+    x0 = w * 0.5 + (yy - h / 2.0) * np.tan(np.radians(angle_deg))
+    img = np.where(xx > x0, level + contrast / 2, level - contrast / 2)
+    if ss > 1:
+        img = img.reshape(h, ss, w, ss).mean(axis=(1, 3))
+    refl = np.repeat(img.astype(np.float32)[..., None], 3, axis=2)
+    return Scene(name="slanted_edge", reflectance=refl,
+                 note=f"斜边靶标 {angle_deg}°（SFR/MTF 测量用）")
+
+
 def uniform_scene(w: int, h: int, level: float = 0.55) -> Scene:
     """匀光板：行轮廓完全平坦。
 
@@ -243,4 +268,5 @@ def build_all(w: int = 480, h: int = 360) -> dict:
         "natural_normal": natural_scene(w, h, backlit=False),
         "muted_red": muted_scene(w, h),
         "uniform": uniform_scene(w, h),
+        "slanted_edge": slanted_edge_target(w, h),
     }

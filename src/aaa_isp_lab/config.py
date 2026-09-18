@@ -21,6 +21,14 @@ class SensorConfig:
     full_well_e: float = 12000.0              # 满阱电子数
     read_noise_e: float = 1.8                 # 读出噪声 (e- rms)
     dark_current_e_per_s: float = 30.0        # 暗电流 (e-/s)
+    # 读出噪声参考位置，决定"提高增益到底有没有用"：
+    #   'iso_less'     读出噪声折算到**输入端**且与增益无关（理想 ISO 无关传感器）
+    #                  -> 增益只放大同一份光子噪声，暗部 SNR 不变
+    #   'gain_referred'读出噪声在**增益之后**加入（真实传感器的典型情况：
+    #                  噪声主要来自源跟随器与 ADC），折算到输入端要除以增益
+    #                  -> 高增益压低输入折算噪声，暗部 SNR 变好
+    # 这就是 ISO 存在的意义，也是"增益无用论"不成立的区域。
+    read_noise_model: str = "iso_less"
     min_exposure_s: float = 1.0 / 8000.0
     max_exposure_s: float = 1.0 / 30.0
     max_analog_gain: float = 16.0             # 模拟增益上限

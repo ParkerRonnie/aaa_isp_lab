@@ -58,7 +58,11 @@ class SensorSim:
             lam = np.maximum(electrons, 0.0)
             electrons = self.rng.poisson(lam).astype(np.float64)
             electrons = np.clip(electrons, 0.0, cfg.full_well_e)
-            electrons += self.rng.normal(0.0, cfg.read_noise_e, size=electrons.shape)
+            # 读出噪声的折算位置决定增益的作用（详见 SensorConfig.read_noise_model）
+            nr = cfg.read_noise_e
+            if getattr(cfg, "read_noise_model", "iso_less") == "gain_referred":
+                nr = nr / max(gain, 1e-6)
+            electrons += self.rng.normal(0.0, nr, size=electrons.shape)
 
         # 量化：电子 -> DN（含黑电平），12bit 定点
         dn = electrons / cfg.full_well_e * cfg.signal_dn + cfg.black_level_dn
