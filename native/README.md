@@ -32,13 +32,17 @@ python tools/build_native.py --check        # 校验可加载 + ABI 版本（CI 
 `build_native.py` 的开关：`--print-cmd`（只打印命令，CI 日志留痕）、`--clean`、
 `--cxx clang++`、`--opt -O2`。找不到编译器时退出码 **2**；库不可加载时 **3**。
 
-### 编译选项的三条禁令
+### 编译选项的四条禁令
 
 - **不许 `-ffast-math`**：会破坏 NaN 语义与浮点等价性断言。
   本项目的等价性测试依赖 IEEE 语义（尤其 `_center_weight` 在 `h==1` 时是 `0/0=nan`，
   这是**保持与 Python 一致**的行为，不是 bug）。
-- **不许 `-march=native`**：本地 g++ 8.1 与 CI 的 gcc 会用不同指令集，
-  跨机性能数字就不可比了。
+- **必须 `-ffp-contract=off`**。GCC 对 C++ 默认 `-ffp-contract=fast`，会把
+  `a + b*c` 融合成一条 FMA —— 精度更高但**结果不同**。`percentile` 的逐位复刻
+  依赖严格的 IEEE 语义，而不同发行版的 GCC 默认目标不同（有的基线已含 FMA）。
+  实测：**不加这一条，同一份代码在 MinGW 8.1 上与 numpy 逐位相等，
+  在 ubuntu 的 gcc 13 上就差 4e-8** —— CI 直接红，而本地全绿。
+- **不许 `-march=native`**：本地与 CI 的指令集不同，跨机性能数字就不可比了。
 - **不许 OpenMP / 多线程**：与 numpy 的线程策略不可比，且引入不可复现的方差。
 
 另外不用 `std::filesystem`（g++ 8 需要额外 `-lstdc++fs`）。`-std=c++17` 在 g++ 8.1 上够用。

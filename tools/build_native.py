@@ -41,7 +41,13 @@ EXIT_OK, EXIT_NO_COMPILER, EXIT_BAD_LIB = 0, 2, 3
 BASE_FLAGS = ["-std=c++17", "-Wall", "-Wextra", "-Wno-unused-parameter",
               # -DNDEBUG 不只是关 assert：aaa_build_info() 会把它报成 release/debug，
               # 而这个字符串要原样写进报告。不传的话报告里会写着 debug 却在跑 -O3。
-              "-DNDEBUG"]
+              "-DNDEBUG",
+              # **必须显式关掉 FMA 收缩**。GCC 对 C++ 默认 -ffp-contract=fast，
+              # 会把 `a + b*c` 融合成一条 FMA（精度更高但结果不同）。`percentile`
+              # 的逐位复刻依赖严格的 IEEE 语义，而不同发行版的 GCC 默认目标不同
+              # （有的基线已含 FMA）—— 实测：不加这一条，同一份代码在 MinGW 8.1 上
+              # 与 numpy 逐位相等，在 ubuntu 的 gcc 13 上就差 4e-8。
+              "-ffp-contract=off"]
 
 
 def find_compiler(explicit=None):
