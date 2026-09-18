@@ -109,7 +109,7 @@ def test_bench_harness_sample_count_and_stats():
 # =============================================================================
 # 需要共享库的用例（条件注册）
 # =============================================================================
-def _register_native_cases():
+if loader.status()["available"]:
 
     @case
     def test_ae_percentile_is_bit_exact():
@@ -305,13 +305,6 @@ def _register_native_cases():
             assert abs(a.sat_mean - b.sat_mean) < 1e-9
             assert abs(a.frac_ge - b.frac_ge) < 1e-9
 
-
-if loader.status()["available"]:
-    _register_native_cases()
-else:
-    _N = 12
-    print(f"[native] 未找到共享库，跳过 {_N} 条 C 路径测试"
-          f"（构建：python tools/build_native.py）")
 
 
 def run_all():
