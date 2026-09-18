@@ -15,7 +15,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+plt.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei",      # Windows
+    "PingFang SC",          # macOS
+    "Noto Sans CJK SC",     # Linux（CI 里装的是 fonts-noto-cjk）
+    "WenQuanYi Zen Hei",    # Linux 常见备选
+    "SimHei",
+    "DejaVu Sans",          # 兜底：没有中文字体时不会崩，但中文会变方块
+]
 plt.rcParams["axes.unicode_minus"] = False
 plt.rcParams["figure.dpi"] = 130
 plt.rcParams["savefig.bbox"] = "tight"

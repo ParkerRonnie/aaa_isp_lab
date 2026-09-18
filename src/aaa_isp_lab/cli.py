@@ -4,6 +4,12 @@
     python -m aaa_isp_lab            # 跑完全部实验并生成报告
     aaa-isp-lab --fast               # 安装后可直接用命令
     aaa-isp-lab --out docs           # 指定输出目录
+
+注意 `run()` 与 `main()` 的分工：
+`run()` 返回产物路径字典，给程序化调用用；
+`main()` 只返回退出码 —— 因为 console script 的包装器会执行
+`sys.exit(main())`，如果 main 返回的是字典，Python 会把它打印出来并以
+退出码 1 结束（命令明明跑成功了，CI 却红）。这个坑只有装成命令行工具才会暴露。
 """
 import argparse
 import json
@@ -18,7 +24,8 @@ from .eval import report as RP
 from . import experiments as EX
 
 
-def main(argv=None):
+def run(argv=None) -> dict:
+    """跑完全部实验并生成报告，返回产物路径。"""
     ap = argparse.ArgumentParser(
         prog="aaa-isp-lab",
         description="3A（AE/AWB/AF）算法与 ISP 画质调优实验平台")
@@ -88,6 +95,12 @@ def main(argv=None):
     print(f"  {paths['md']}")
     print(f"  {paths['html']}")
     return paths
+
+
+def main(argv=None) -> int:
+    """命令行入口：只返回退出码。"""
+    run(argv)
+    return 0
 
 
 def _sanitize(obj, depth=0):
