@@ -1387,9 +1387,14 @@ numpy 的 `mean()` 是 SIMD 归约，标量 double 循环赢不了它。
 |---|---|---|---|---|---|
 {rows_e}
 
-`white_patch` 的偏差是 **0.00e+00** —— 逐位相等。做法是照抄 numpy 的
-`virtual_index` 运算顺序、`_lerp` 的两分支写法、以及 `(b-a)` 必须在 float32 里减
-这三条细节，所以 99.5 分位可以逐位复刻（AE 的 99 分位同理，测试里是 tol=0）。
+`white_patch` 的偏差是 **0.00e+00** —— 与**开发环境验证过的 numpy 1.26.4** 逐位相等。
+做法是照抄 numpy 的 `virtual_index` 运算顺序、`_lerp` 的两分支写法、以及 `(b-a)` 必须在
+float32 里减这三条细节。
+
+⚠️ **这个「逐位」有版本边界**：CI 装的是 numpy 2.x，而 numpy 在 1.26 → 2.x 之间
+**改过 quantile 的实现**（同一份输入下 p99 相差约 1 个 float32 ulp）。有意思的是
+**C 侧的结果跨平台完全一致，变的是 numpy** —— 所以准确的说法是「复刻了开发时
+验证过的那版语义」，不能无条件说「和 numpy 逐位相等」。
 `gray_world` 的 ~2.8e-6 不是"我们算错了"：numpy 用 float32 pairwise、C 用 double
 顺序累加，**差的是 numpy 自身的误差**，测试里还额外断言了"C 更接近 float64 精确值"。
 

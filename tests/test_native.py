@@ -124,17 +124,26 @@ class _StubFrame:
 if loader.status()["available"]:
 
     @case
-    def test_percentile_is_bit_exact_on_controlled_input():
-        """**tol=0**：分位数实现对受控输入与 `np.percentile` 逐位相等。
+    def test_percentile_on_controlled_input_matches_numpy():
+        """分位数实现对受控输入与 `np.percentile` 一致到 **float32 ulp 量级**。
 
-        依据是 numpy 的算法完全确定，只要照抄三处细节：`virtual_index` 的运算顺序
-        （不能简化成 q*(n-1)）、`_lerp` 的两分支写法、(b-a) 必须在 float32 里减。
-        这里用几种不同分布（均匀 ramp、大量重复值、随机、含饱和）把它钉死。
+        实现上照抄了 numpy 的三处细节：`virtual_index` 的运算顺序（不能简化成
+        `q*(n-1)`）、`_lerp` 的两分支写法、`(b-a)` 必须在 float32 里减。
 
-        为什么是受控输入而不是仿真帧：仿真帧的 `luma_linear` 是 numpy+OpenCV 算出来的，
-        而 numpy/cv2 的版本差异会改变它的**最低位**（实测 py3.10 与 py3.11 上
-        `np.percentile` 的结果就不同）。拿它做跨平台 tol=0 比对，测的是
-        "两个环境的 ISP 输出是否逐位一致"，不是"我的实现对不对"。
+        为什么不是 tol=0：**numpy 自己改过量化的实现**。实测同一份输入
+        （`linspace(0,1,27648)` 的 p99）：
+
+            numpy 1.26.4 (开发环境)  0.9899999922513961
+            numpy 2.x   (CI py3.10) 0.9899999499320984
+            numpy 2.x   (CI py3.11) 0.9900000095367432
+
+        也就是说"逐位复刻 numpy"这个说法**是有版本依赖的** —— 复刻的是开发时
+        验证过的那一版语义。跨 numpy 版本差约 1 个 float32 ulp（~4e-8 相对），
+        这里按实测给到 1e-6（20 倍余量），足以捕获真实实现错误
+        （写错的话偏差是 0.5 这个量级 —— 收集到未排序数组时就差过一倍）。
+
+        注意 C 侧的结果在 Windows 与 Linux 上**完全一致**（都是 0.9899999922513961），
+        跨平台不稳的是 numpy，不是我们。
         """
         rng = np.random.default_rng(20260919)
         shp = (H, W)
@@ -150,7 +159,10 @@ if loader.status()["available"]:
         for name, arr in cases.items():
             ref = float(np.percentile(arr, 99))
             got = float(fn(_StubFrame(arr), cfg)["metric"])
-            assert got == ref, f"{name}: 不是逐位相等 {ref!r} vs {got!r}"
+            rel = abs(got - ref) / max(abs(ref), 1e-12)
+            assert rel < 1e-6, (
+                f"{name}: 相对差 {rel:.3e} 超容差 —— {ref!r} vs {got!r}"
+                f"（numpy {np.__version__}；跨版本差异实测 ~4e-8）")
 
     @case
     def test_ae_percentile_on_simulated_frame_within_ulp():

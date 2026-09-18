@@ -123,9 +123,8 @@ python tools/build_native.py --check        # 校验可加载 + ABI 版本（CI 
 
 ## 逐位复刻 numpy 的 `percentile`
 
-`highlight_priority` 的 99 分位与 `white_patch` 的 99.5 分位都可以与
-`np.percentile(..., method='linear')` **逐位相等**（实测偏差 0.00e+00）。
-依据是 numpy 的算法完全确定，只要照抄三处细节：
+`highlight_priority` 的 99 分位与 `white_patch` 的 99.5 分位复刻了
+`np.percentile(..., method='linear')` 的算法，只要照抄三处细节：
 
 1. `virtual_index = n*q + (1 + q*(1-1-1)) - 1` —— **运算顺序不能简化成 `q*(n-1)`**，
    否则末几位会不一致。
@@ -135,6 +134,21 @@ python tools/build_native.py --check        # 校验可加载 + ABI 版本（CI 
 
 现成的证据：`np.linspace(0,1,172800)` 的 p99 实测是 `0.9900000077486039`，
 与解析值 0.99 差 7.7e-9 —— 正是上面这些浮点细节造成的。
+
+⚠️ **但「逐位一致」是有版本依赖的，不能无条件说。** 实测同一份输入
+（`linspace(0,1,27648)` 的 p99）：
+
+| 环境 | numpy 的值 | C 的值 |
+|---|---|---|
+| numpy 1.26.4（开发环境） | 0.9899999922513961 | 0.9899999922513961 |
+| numpy 2.x（CI / py3.10） | 0.9899999499320984 | 0.9899999922513961 |
+| numpy 2.x（CI / py3.11） | 0.9900000095367432 | 0.9899999922513961 |
+
+**C 侧的结果跨平台完全一致**；变的是 numpy —— numpy 在 1.26 → 2.x 之间改过
+quantile 的实现。所以准确的说法是：**复刻的是开发时验证过的那一版 numpy 语义，
+跨 numpy 版本差约 1 个 float32 ulp（~4e-8 相对）**。
+测试里按实测定容差（1e-6，20 倍余量），足以捕获真实错误 ——
+写错的话偏差是 0.5 这个量级（收集到未排序数组时就差过一倍）。
 
 ⚠️ **一个不许写进报告的结论**：不要说「C 用直方图把分位数从 O(n log n) 变成 O(n)」。
 `np.percentile` 走的是 `arr.partition()`（introselect），**本来就是 O(n)**。

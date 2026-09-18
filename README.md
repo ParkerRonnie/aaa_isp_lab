@@ -20,7 +20,7 @@
 pip install -e ".[dev]"      # 可编辑安装（提供 aaa-isp-lab 命令）
 aaa-isp-lab                  # 跑完全部实验并生成报告（约 4 分钟，约 3200 次成像）
 aaa-isp-lab --fast           # 快速模式（小图、少重复，约 45s）
-pytest                       # 38 个单元测试
+pytest                       # 51 个单元测试（38 个纯 Python + 编译后 13 个 C 路径）
 ```
 
 不想安装也可以直接跑：`python run_all.py --fast`（等价于 `python -m aaa_isp_lab`）。
@@ -84,9 +84,11 @@ aaa_isp_lab/
 │   │   ├── metrics.py      PSNR/SSIM/ΔE00/中性色度 + 时域抖动统计
 │   │   ├── image_quality.py 画质指标：斜边 MTF / 光子转换曲线 / 动态范围 / 阴影
 │   │   └── report.py       图表与报告生成
-│   ├── experiments.py      15 组实验的定义（只产出数据，不画图）
+│   ├── experiments.py      17 组实验的定义（只产出数据，不画图）
 │   └── cli.py              命令行入口与结果落盘
-├── tests/test_aaa.py       38 个单元测试（含 CIEDE2000 官方测试数据）
+├── tests/test_aaa.py       38 个纯 Python 单元测试（含 CIEDE2000 官方测试数据）
+├── tests/test_native.py    13 个 C 路径用例（按能否加载共享库条件注册）
+├── native/                 C++ 统计通路（可选组件，见 native/README.md）
 ├── docs/                   已发布的报告快照与图表
 └── pyproject.toml
 ```
@@ -261,11 +263,17 @@ python tools/build_native.py --with-bench    # 需要 g++/clang++，不需要 MS
 4 次全帧开方，且无条件计算 4 个估计器（其中 `shades_of_gray` 的结果**根本没进融合**）。
 **"C++ 比 numpy 快 16 倍"是错的说法。**
 
-**结论二：等价性可以做到逐位。**
+**结论二：等价性可以做到逐位（但有版本边界）。**
 
-`white_patch` 的 99.5 分位与浮点参考**逐位相等**（偏差 0.00e+00），做法是照抄 numpy
-的 `virtual_index` 运算顺序、`_lerp` 的两分支写法、以及 `(b-a)` 必须在 float32 里减。
-掩码计数 `n_valid` 也是逐位相等。均值类的 ~2.8e-6 相对差**不是我们算错了** ——
+`white_patch` 的 99.5 分位与**开发环境验证过的 numpy 1.26.4** 逐位相等（偏差 0.00e+00），
+做法是照抄 numpy 的 `virtual_index` 运算顺序、`_lerp` 的两分支写法、以及 `(b-a)` 必须在
+float32 里减。掩码计数 `n_valid` 同样逐位相等。
+
+⚠️ **这个「逐位」是有版本依赖的**：CI 装的是 numpy 2.x，而 numpy 在 1.26 → 2.x 之间
+**改过 quantile 的实现**，同一份输入下 p99 相差约 1 个 float32 ulp（~4e-8 相对）。
+**C 侧的结果跨平台完全一致，变的是 numpy。** 准确说法是「复刻了开发时验证过的那版语义」。
+
+均值类的 ~2.8e-6 相对差**不是我们算错了** ——
 numpy 用 float32 pairwise、C 用 double 顺序累加，差的是 numpy 自身的误差；
 测试里还额外断言了"C 更接近 float64 精确值"。
 
