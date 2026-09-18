@@ -262,7 +262,7 @@ Python 3.8+，依赖 `numpy`、`opencv-python`、`scipy`、`matplotlib`。
 （开发环境为 Python 3.10 + numpy 1.26 + opencv 4.9 + scipy 1.13 + matplotlib 3.8）
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[dev]"      # 依赖以 pyproject.toml 为唯一来源
 ```
 
 > 提示：需要中文字体（Windows 自带 Microsoft YaHei，Linux 需安装 SimHei 或
