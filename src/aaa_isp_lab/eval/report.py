@@ -713,6 +713,18 @@ LSC 必须在 RAW 域按 CFA 通道分别补偿 —— 阴影衰减是光子层�
     dr = iq["dynamic_range"]
     gn = iq["gain_vs_noise"]
 
+    # 由 MTF vs 镜头位置数据派生的几个量（第 11.2 节要用）
+    _foc = iq["mtf_vs_focus"]
+    _lin = np.asarray(_foc["mtf50"], dtype=float)
+    _disp = np.asarray(_foc["mtf50_display"], dtype=float)
+    _tg = np.asarray(_foc["tenengrad"], dtype=float)
+    _ok = ~np.isnan(_lin)
+    mtf_peak = float(_foc["positions"][int(np.nanargmax(_lin))])
+    mtf_corr = float(np.corrcoef(_lin[_ok], _tg[_ok])[0, 1])
+    mtf_lin_peak = float(np.nanmax(_lin))
+    mtf_disp_peak = float(np.nanmax(_disp))
+    sharp_gain = float(np.nanmean(_disp) / np.nanmean(_lin))
+
     rows_mtf = "\n".join(
         f'| {r["sigma"]:.1f} | {r["angle"]:.2f} | {r["mtf50"]:.3f} | {r["mtf50_theory"]:.3f} | '
         f'{r["dev_pct"]:+.1f}% | {r["curve_err"]:.3f} |'
