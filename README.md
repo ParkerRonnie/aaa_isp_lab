@@ -1,5 +1,9 @@
 # 3A ISP Lab —— AE / AWB / AF 算法与调优实验平台
 
+[![CI](https://github.com/ParkerRonnie/aaa_isp_lab/actions/workflows/ci.yml/badge.svg)](https://github.com/ParkerRonnie/aaa_isp_lab/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11-blue.svg)](pyproject.toml)
+
 一个从**物理建模 → ISP 链路 → 3A 闭环控制 → 量化评价 → 实验报告**全流程跑通的
 相机 3A 算法实验平台。所有结论都有可复现的数字，而不是"看起来很对"。
 
@@ -11,14 +15,19 @@
 - 评价指标：光源角度误差、ΔE00、中性区残余色度、CCT/Duv、收敛帧数、半高宽、动态范围……
 
 ```bash
-python run_all.py            # 跑完全部实验并生成报告（约 60s，约 780 次成像）
-python run_all.py --fast     # 小图快速验证（约 15s）
-python tests/test_aaa.py     # 21 个单元测试
+pip install -e ".[dev]"      # 可编辑安装（提供 aaa-isp-lab 命令）
+aaa-isp-lab                  # 跑完全部实验并生成报告（约 60s，约 780 次成像）
+aaa-isp-lab --fast           # 快速模式（小图、少重复，约 15s）
+pytest                       # 21 个单元测试
 ```
 
-产出：`out/report.html`（自包含，含全部图表与结论）、`out/report.pdf`、`out/report.md`、`out/results.json`
+不想安装也可以直接跑：`python run_all.py --fast`（等价于 `python -m aaa_isp_lab`）。
 
-![ISP 各阶段](out/fig_isp_stages.png)
+产出：`report.html`（自包含，含全部图表与结论）、`report.pdf`、`report.md`、`results.json`。
+仓库里的 `docs/` 是**已发布的报告快照**（随代码一起提交，README 直接引用）；
+默认输出到 `out/`，用 `--out docs` 刷新快照。
+
+![ISP 各阶段](docs/fig_isp_stages.png)
 
 ---
 
@@ -53,27 +62,34 @@ python tests/test_aaa.py     # 21 个单元测试
 
 ```
 aaa_isp_lab/
-├── run_all.py                  # 实验编排：跑全部实验 → 生成报告
-├── src/
-│   ├── config.py               # 集中 tuning 参数表（模拟真实 ISP 的参数管理）
-│   ├── color_science.py        # 色温<->色度、sRGB/XYZ/Lab、普朗克轨迹、Duv、CIEDE2000 前置
-│   ├── sim/
-│   │   ├── scene.py            # 合成场景（色卡 / 对焦标板 / 逆光人像 / 单色 / 匀光板）
-│   │   ├── optics.py           # 抗锯齿离焦 PSF、运动模糊、镜头阴影、横向色差
-│   │   ├── sensor.py           # 光电转换、散粒/读出噪声、CFA 采样、量化
-│   │   └── camera.py           # 曝光分配、闪烁带纹、EV 范围约束、成像入口
-│   ├── isp/
-│   │   ├── modules.py          # BLC / LSC / 去马赛克 / WB / CCM / 色调映射 / 降噪锐化
-│   │   └── pipeline.py         # 管线编排，同时输出多个"域"供 3A 各自使用
-│   ├── aaa/
-│   │   ├── ae.py               # 测光 + 变步长闭环 + 标定查表
-│   │   ├── awb.py              # 5 种估计器 + 置信度融合 + 色温先验约束
-│   │   └── af.py               # 5 种评价函数 + 4 种搜索策略 + 四性分析
-│   └── eval/
-│       ├── metrics.py          # PSNR/SSIM/ΔE00/中性色度
-│       └── report.py           # 图表与报告生成
-└── tests/test_aaa.py           # 21 个单元测试（含 CIEDE2000 官方测试数据）
+├── src/aaa_isp_lab/
+│   ├── config.py           所有可调参数集中在这里（模拟真实 ISP 的 tuning 表）
+│   ├── color_science.py    色温/色度、sRGB/XYZ/Lab、普朗克轨迹、Duv
+│   ├── sim/                物理建模：世界怎么成像
+│   │   ├── scene.py        合成场景（色卡 / 对焦标板 / 逆光人像 / 单色 / 匀光板）
+│   │   ├── optics.py       抗锯齿离焦 PSF、运动模糊、镜头阴影、横向色差
+│   │   ├── sensor.py       光电转换、散粒/读出噪声、CFA 串扰、量化
+│   │   └── camera.py       曝光分配、闪烁带纹、EV 范围约束、成像入口
+│   ├── isp/                处理链路：RAW 怎么变成图
+│   │   ├── modules.py      BLC / LSC / 去马赛克 / WB / CCM / 色调映射 / 降噪锐化
+│   │   └── pipeline.py     管线编排，同时输出多个"域"供 3A 各自使用
+│   ├── aaa/                控制算法：怎么决策
+│   │   ├── ae.py           测光 + 变步长闭环 + 标定查表 + 抗闪烁
+│   │   ├── awb.py          5 种估计器 + 置信度融合 + CCT/Duv 约束
+│   │   └── af.py           5 种评价函数 + 4 种搜索策略 + 四性分析
+│   ├── eval/               评价与呈现
+│   │   ├── metrics.py      PSNR/SSIM/ΔE00/中性色度
+│   │   └── report.py       图表与报告生成
+│   ├── experiments.py      10 组实验的定义（只产出数据，不画图）
+│   └── cli.py              命令行入口与结果落盘
+├── tests/test_aaa.py       21 个单元测试（含 CIEDE2000 官方测试数据）
+├── docs/                   已发布的报告快照与图表
+└── pyproject.toml
 ```
+
+分层是刻意的：`sim` 只管成像、`isp` 只管处理、`aaa` 只管决策、`eval` 只管评价，
+**任何一层都不反向依赖上层** —— 所以每个实验都能单独调用、单独验证，
+而不是一堆只能整体跑的脚本。
 
 ---
 
@@ -94,9 +110,9 @@ aaa_isp_lab/
 五种方式**全部正常收敛**，主体码值却相差 35 —— "AE 准不准"这个问法本身是错的，
 先要问测的是什么。
 
-![逆光场景五种测光方式对比](out/fig_ae_metering.png)
+![逆光场景五种测光方式对比](docs/fig_ae_metering.png)
 
-![AE 收敛过程与误差下降曲线](out/fig_ae_convergence.png)
+![AE 收敛过程与误差下降曲线](docs/fig_ae_convergence.png)
 
 ### AE 执行器分配（低照度）
 
@@ -107,9 +123,9 @@ aaa_isp_lab/
 
 **增益放大的是同一份光子噪声，SNR 几乎不变**；换来的只是更短的曝光和更少的运动模糊。
 
-![曝光策略对比与抗闪烁](out/fig_ae_policy.png)
+![曝光策略对比与抗闪烁](docs/fig_ae_policy.png)
 
-![交流光源带纹：曝光时间是否落在 10ms 整数倍上](out/fig_ae_flicker.png)
+![交流光源带纹：曝光时间是否落在 10ms 整数倍上](docs/fig_ae_flicker.png)
 
 ### AWB（光源角度误差，度）
 
@@ -121,9 +137,9 @@ aaa_isp_lab/
 
 同一套算法在不同场景下的排名**完全颠倒**，没有一种算法在所有场景都赢。
 
-![AWB 各算法在不同场景下的输出与光源误差](out/fig_awb_grid.png)
+![AWB 各算法在不同场景下的输出与光源误差](docs/fig_awb_grid.png)
 
-![各算法光源估计误差对比](out/fig_awb_error.png)
+![各算法光源估计误差对比](docs/fig_awb_error.png)
 
 ### 色温先验：只治色温，不治 Duv
 
@@ -136,7 +152,7 @@ aaa_isp_lab/
 三个场景只有**一个**触发了约束；误差最大的那一个（36.6°）估计色温"看着很正常"，
 错误全在 Duv 方向上 —— **把色温范围钳位当作保护措施，实际几乎不起作用**。
 
-![色温先验约束的效果](out/fig_awb_constraint.png)
+![色温先验约束的效果](docs/fig_awb_constraint.png)
 
 ### 对焦评价函数
 
@@ -150,7 +166,7 @@ aaa_isp_lab/
 
 FFT 高频占比看起来最"优雅"，动态范围只有 2.6 dB —— 几乎没有分辨能力。
 
-![五种对焦评价函数曲线对比](out/fig_af_curves.png)
+![五种对焦评价函数曲线对比](docs/fig_af_curves.png)
 
 ### 搜索策略
 
@@ -164,14 +180,14 @@ FFT 高频占比看起来最"优雅"，动态范围只有 2.6 dB —— 几乎�
 黄金分割在严格单峰函数上理论最优，实测输给粗到细 —— 它一旦被假峰误导，
 就会被**永久关在错误的区间里**（区间收缩不可逆）。理论最优 ≠ 工程可用。
 
-![搜索策略：帧数与定位精度的取舍](out/fig_af_search.png)
+![搜索策略：帧数与定位精度的取舍](docs/fig_af_search.png)
 
 ### 3A 耦合：三者不是独立的三个模块
 
 欠曝到 -3 EV 以下 AWB 直接完全失效（误差 0.69° → 10.61°）；过曝时对焦评价函数的
 动态范围从 15.0 dB 塌到 7.5 dB。**欠曝主要伤 AWB，过曝主要伤 AF。**
 
-![3A 耦合：曝光对 AWB 与 AF 的影响](out/fig_coupling.png)
+![3A 耦合：曝光对 AWB 与 AF 的影响](docs/fig_coupling.png)
 
 ---
 
