@@ -1,11 +1,22 @@
+# 构建/生成产物
+out/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# 编辑器
 .idea/
 .vscode/
 
-# 生成产物不入库，但保留图表（README 要内嵌显示，GitHub 上才好看）
-out/*
-!out/*.png
-
-# 个人面试准备材料：不入库、不公开
+# 个人面试准备材料：不入库
 面试讲稿.md

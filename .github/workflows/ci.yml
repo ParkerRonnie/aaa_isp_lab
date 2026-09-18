@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 单元测试 / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # 图表里的中文标签需要 CJK 字体，否则渲染成方块（不报错，但图不可读）
+      - name: 安装中文字体
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 单元测试
+        run: pytest -v
+
+      - name: 端到端冒烟（快速模式，确认能出报告）
+        run: aaa-isp-lab --fast --out /tmp/ci_out
+
+      - name: 确认产物齐全
+        run: |
+          test -f /tmp/ci_out/report.html
+          test -f /tmp/ci_out/report.md
+          test -f /tmp/ci_out/results.json
+          ls /tmp/ci_out | wc -l
