@@ -5,6 +5,17 @@ dist/
 *.egg-info/
 .eggs/
 
+# C++ 编译产物：库与可执行都是本机编出来的，不进仓库
+# （python tools/build_native.py 可以重新生成；源码在 native/）
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.exe
+
 # Python
 __pycache__/
 *.py[cod]

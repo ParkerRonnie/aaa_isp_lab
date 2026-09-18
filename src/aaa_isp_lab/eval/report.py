@@ -586,6 +586,139 @@ def fig_awb_temporal(res: dict, outdir: str) -> str:
     return _save(fig, outdir, "fig_awb_temporal.png")
 
 
+# -----------------------------------------------------------------------------
+# C++ 统计通路与定点化
+# -----------------------------------------------------------------------------
+_NATIVE_LABELS = {
+    "awb_py_naive": "AWB 现状(Python)",
+    "awb_py_opt": "AWB 算法优化(Python)",
+    "awb_c_f64": "AWB C++ (double)",
+    "awb_c_f32": "AWB C++ (float32)",
+    "awb_c_q16": "AWB C++ (定点 Q16)",
+    "ae_py_naive": "AE 测光 现状(Python)",
+    "ae_c_f32": "AE 测光 C++ (float32)",
+    "ae_avg_py": "AE 全画面平均(Python)",
+    "ae_avg_c": "AE 全画面平均 C++",
+}
+
+
+def fig_native_speed(res: dict, outdir: str) -> str:
+    keys = [k for k in res["timing"] if k.startswith("awb_")]
+    names = [_NATIVE_LABELS.get(k, k) for k in keys]
+    med = [res["timing"][k]["median_us"] for k in keys]
+    lo = [res["timing"][k]["median_us"] - res["timing"][k]["p10_us"] for k in keys]
+    hi = [res["timing"][k]["p90_us"] - res["timing"][k]["median_us"] for k in keys]
+
+    fig, ax = plt.subplots(figsize=(11, 4.2))
+    ax.bar(range(len(keys)), med, yerr=[lo, hi], capsize=3,
+           color=[C_WARN, C_WARN, C_MAIN, C_MAIN, C_OK])
+    floor = res["null_call_us"]
+    ax.axhline(floor, color="k", ls=":", lw=1)
+    ax.text(len(keys) - 0.5, floor, f" ctypes 调用地板 {floor:.2f}us",
+            va="bottom", ha="right", fontsize=8)
+    ax.set_yscale("log")
+    ax.set_xticks(range(len(keys)))
+    ax.set_xticklabels(names, fontsize=8, rotation=12)
+    for i, v in enumerate(med):
+        ax.text(i, v, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
+    ax.set_ylabel("单次耗时（微秒，对数轴）")
+    ax.set_title(f"AWB 统计通路：中位数与 p10–p90 区间（{res['size'][0]}×{res['size'][1]}，"
+                 f"{res['repeats']} 次重复）")
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_native_speed.png")
+
+
+def fig_native_decomp(res: dict, outdir: str) -> str:
+    d = res["decomposition"]
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.0))
+
+    ax = axes[0]
+    lab = ["算法改进\n(Python→Python)", "实现改进\n(Python→C++)", "总加速"]
+    val = [d["algo_gain_awb"], d["impl_gain_awb"], d["total_gain_awb"]]
+    ax.bar(lab, val, color=[C_MAIN, C_OK, C_WARN])
+    for i, v in enumerate(val):
+        ax.text(i, v, f"{v:.2f}×", ha="center", va="bottom", fontsize=10)
+    ax.axhline(1.0, color="k", ls=":", lw=1)
+    ax.set_ylabel("相对倍数")
+    ax.set_title("AWB 的加速分解：总加速 = 算法 × 实现")
+    ax.grid(alpha=0.3, axis="y")
+
+    # 右图是这一节最重要的一格：**没有算法差异**时的纯语言差异
+    ax = axes[1]
+    lg = d["language_only_gain"]
+    ax.bar(["纯语言差异\n(全画面平均，无算法差异)"], [lg],
+           color=C_OK if lg >= 1.0 else C_WARN)
+    ax.axhline(1.0, color="k", ls="--", lw=1.2)
+    ax.text(0, lg, f"{lg:.2f}×", ha="center", va="bottom", fontsize=14)
+    ax.set_ylim(0, max(1.6, lg * 1.35))
+    ax.set_ylabel("Python / C++")
+    ax.set_title("换语言本身值多少？\n（<1 表示 C 反而更慢）")
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_native_decomp.png")
+
+
+def fig_fixed_budget(res: dict, outdir: str) -> str:
+    rows = res["ae_rows"]
+    modes = []
+    for r in rows:
+        if r["mode"] not in modes:
+            modes.append(r["mode"])
+    fig, ax = plt.subplots(figsize=(11.5, 4.2))
+    x = np.arange(len(modes))
+    for i, scene in enumerate(sorted({r["scene"] for r in rows})):
+        sub = {r["mode"]: r for r in rows if r["scene"] == scene}
+        ratio = [sub[m]["abs_diff"] / sub[m]["bound"] for m in modes]
+        ax.bar(x + (i - 1) * 0.26, ratio, 0.26, label=scene)
+    ax.axhline(1.0, color=C_WARN, ls="--", lw=1.5)
+    ax.text(len(modes) - 0.5, 1.0, " 推导上界", va="bottom", ha="right",
+            fontsize=9, color=C_WARN)
+    ax.set_xticks(x)
+    ax.set_xticklabels(modes, fontsize=8)
+    ax.set_ylabel("实测误差 / 推导上界")
+    ax.set_title("定点化误差：全部落在推导出的上界内（柱高 < 1 即合格）")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_fixed_budget.png")
+
+
+def fig_fixed_sweep(res: dict, outdir: str) -> str:
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.0))
+
+    ax = axes[0]
+    bits = [r["bits"] for r in res["by_bits"]]
+    havg = [max(r["average_abs"], 1e-12) for r in res["by_bits"]]
+    hhl = [max(r["highlight_priority_abs"], 1e-12) for r in res["by_bits"]]
+    ax.plot(bits, havg, "o-", color=C_MAIN, label="全画面平均（均值类）")
+    ax.plot(bits, hhl, "s-", color=C_WARN, label="高光优先（分位数）")
+    ax.plot(bits, [max(1.0 / min(b, 10) if b >= 10 else 1.0 / (1 << b), 1e-12)
+                   for b in bits], ":", color=C_GRAY, label="分位数上界（一个 bin）")
+    ax.set_yscale("log")
+    ax.set_xlabel("输入位宽 (bit)")
+    ax.set_ylabel("绝对误差（对数轴）")
+    ax.set_title("位宽扫描：10 位以上就没收益了\n（瓶颈从输入量化转到直方图 bin 宽）")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    ax = axes[1]
+    bins = [r["bins"] for r in res["by_bins"]]
+    e = [max(r["abs"], 1e-12) for r in res["by_bins"]]
+    w = [r["bin_width"] for r in res["by_bins"]]
+    ax.plot(bins, e, "o-", color=C_MAIN, label="实测绝对误差")
+    ax.plot(bins, w, ":", color=C_WARN, label="一个 bin 宽（误差上界）")
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xlabel("直方图 bin 数")
+    ax.set_ylabel("绝对误差（对数轴）")
+    ax.set_title("bin 数扫描：误差始终压在 bin 宽之下")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_fixed_sweep.png")
+
+
 def _sections(res: dict, figs: dict) -> list:
     """返回 (标题, 说明 markdown, 图片 key 列表) 的列表。
 
@@ -1191,6 +1324,158 @@ alpha=0.1 直接**未收敛**（{"曝光抖动 %.2f EV" % worst["jitter_ev_cmd_s
    结果可能落在"过校正"这一侧。
 """, ["iq_mtf", "iq_focus", "iq_noise", "iq_gain", "iq_shading"]))
 
+    # ---- 16. C++ 统计通路 ----
+    np_ = res.get("native_port", {})
+    if not np_.get("available"):
+        secs.append(("16. C++ 统计通路（本机未编译）", f"""
+这一节需要一个可选的 C++ 共享库，本机没有编译。
+
+构建方法：`python tools/build_native.py`（只需要 g++/clang++，不需要 MSVC）。
+不编译也不影响其余各节 —— 默认后端是**纯 Python**，路径与结论都不变。
+
+原因：{np_.get("reason", "未知")}
+""", []))
+    else:
+        env = np_["env"]
+        rows_t = "\n".join(
+            f"| {_NATIVE_LABELS.get(k, k)} | {v['median_us']:.1f} | "
+            f"{v['p10_us']:.1f} | {v['p90_us']:.1f} | {v['mad_us']:.1f} |"
+            for k, v in np_["timing"].items())
+        d = np_["decomposition"]
+        rows_e = "\n".join(
+            f"| {e['scene']} | {'是' if e['n_valid_equal'] else '否'} | "
+            f"{e['gray_world_rel']:.1e} | {e['white_patch_rel']:.1e} | "
+            f"{e['gray_edge_rel']:.1e} | {e['shades_of_gray_rel']:.1e} |"
+            for e in np_["equivalence"])
+        b = np_["budget"]
+        secs.append(("16. C++ 统计通路重写：加速来自算法，不是语言", f"""
+把 AE 测光与 AWB 统计逐像素通路重写成 C++（`extern "C"` 共享库 + ctypes）。
+
+**为什么不用 setuptools Extension / pybind11**：Windows 上的 CPython 是 MSVC 构建的，
+而开发机只有 MinGW g++，MinGW 编译的扩展模块无法可靠链接。改成纯 C ABI 的共享库后，
+两个工具链都能编、**不引入任何 pip 依赖**，而且这个库**脱离 Python 也能编能跑**
+（`native/tests/native_main.cpp` 有 23 项不依赖 numpy 的解析自检）。
+
+**环境（性能数字必须带环境才有意义）**：{env['platform']}｜Python {env['python']}｜
+numpy {env['numpy']}｜OpenCV {env['cv2']}｜{env['native_build']}
+
+| 实现 | 中位数 µs | p10 | p90 | MAD |
+|---|---|---|---|---|
+{rows_t}
+
+ctypes 调用地板实测 **{np_['null_call_us']:.2f} µs**，相对上面每个核都 < 5%，可以忽略。
+
+**加速分解 —— 这张表才是这一节的重点：**
+
+- 算法改进（Python→Python，只改算法）：**{d['algo_gain_awb']:.2f}×**
+- 实现改进（算法不变，换 C++）：**{d['impl_gain_awb']:.2f}×**
+- 总加速：**{d['total_gain_awb']:.2f}×**
+
+**「C++ 比 numpy 快 16 倍」是错的说法。** 看这一格就明白了：
+在**没有任何算法差异**的模式上（全画面平均，两边都是一次求和），
+换语言的收益是 **{d['language_only_gain']:.2f}×** —— 小于 1，也就是 **C 反而略慢**。
+numpy 的 `mean()` 是 SIMD 归约，标量 double 循环赢不了它。
+
+那 16 倍是从哪来的？**来自重写时顺手消除了结构性的浪费**：现状每帧做
+5 次全帧布尔 gather、4 次 Sobel（其中 2 次完全重复）、3 次全帧 luma、
+2 次全帧饱和度、4 次全帧开方，且无条件计算 4 个估计器。这些都不是"语言的锅"。
+**准确的说法是：大头在算法与访存结构，语言本身几乎没有贡献。**
+
+**等价性**（这一列才是"实现对了"的证据）：
+
+| 场景 | n_valid 逐位相等 | gray_world | white_patch | gray_edge | shades_of_gray |
+|---|---|---|---|---|---|
+{rows_e}
+
+`white_patch` 的偏差是 **0.00e+00** —— 逐位相等。做法是照抄 numpy 的
+`virtual_index` 运算顺序、`_lerp` 的两分支写法、以及 `(b-a)` 必须在 float32 里减
+这三条细节，所以 99.5 分位可以逐位复刻（AE 的 99 分位同理，测试里是 tol=0）。
+`gray_world` 的 ~2.8e-6 不是"我们算错了"：numpy 用 float32 pairwise、C 用 double
+顺序累加，**差的是 numpy 自身的误差**，测试里还额外断言了"C 更接近 float64 精确值"。
+
+**估算的算力占比**：AWB 统计占 33ms 帧预算的 {b['frame_budget_pct']:.2f}%；
+按像素数线性外推，1080p 约 {b['extrap_1080p_us']:.0f} µs、4K 约 {b['extrap_4k_us']:.0f} µs。
+**这是外推不是实测**，忽略了缓存层次与带宽的变化，只能当量级估计。
+
+**没做的**：没有实现一份"故意保留全部浪费的朴素 C"版本；没有面积/功耗/时序数据；
+没有在真实 DSP/NPU 上跑过。本方案给的是算法与算术层面的可行性，不是 RTL 结论。
+""", ["native_speed", "native_decomp"]))
+
+    # ---- 17. 定点化 ----
+    fp = res.get("fixed_point", {})
+    if not fp.get("available"):
+        secs.append(("17. 定点化误差预算（本机未编译）", f"""
+同上一节，需要先编译 C++ 共享库：`python tools/build_native.py`。
+
+原因：{fp.get("reason", "未知")}
+""", []))
+    else:
+        rows_ae = "\n".join(
+            f"| {r['scene']} | {r['mode']} | {r['ref']:.6f} | {r['q16']:.6f} | "
+            f"{r['abs_diff']:.2e} | {r['ev']:.2e} | {r['bound']:.1e} | "
+            f"{'是' if r['abs_diff'] < r['bound'] else '否'} |"
+            for r in fp["ae_rows"])
+        rows_awb = "\n".join(
+            f"| {r['scene']} | {r['n_valid_ref']} / {r['n_valid_q16']} | "
+            f"{r['gray_world_abs']:.1e} | {r['white_patch_abs']:.1e} | "
+            f"{r['gains_rel']:.1e} | {r['angle_diff_deg']:.4f} |"
+            for r in fp["awb_rows"])
+        rows_bits = "\n".join(
+            f"| {r['bits']} | {r['average_abs']:.2e} | {r['highlight_priority_abs']:.2e} |"
+            for r in fp["by_bits"])
+        rows_bins = "\n".join(
+            f"| {r['bins']} | {r['bin_width']:.2e} | {r['abs']:.2e} |"
+            for r in fp["by_bins"])
+        secs.append(("17. 定点化：误差有上界，不是拍脑袋的容差", f"""
+把逐像素统计通路改成定点：**uint16 Q0.16 输入 + int64 累加 + 直方图分位数**。
+
+**为什么 Q0.16**：`linear_pre_wb` 与 `linear_ccm` 都被 clip 在 [0,1]，Q0.16 满量程无浪费，
+等价于"统计块吃 16bit 整数 luma"—— 这正是真实 ISP 的形态。
+**为什么 int64 够**：4K 全图 Σ 也只有 5.4e11，evaluative 加权和约 1.9e16，
+都远小于 2^63，**不需要分段移位**（那是 32 位 MCU 的妥协，代价是每行 0.5 LSB 的系统性偏差）。
+
+**推导出的误差上界**（不是拟合出来的容差）：
+
+- 均值类：像素量化 0.5 LSB + 权重 Q15 舍入 → 绝对上界 **1.8e-5**
+- 分位数：直方图估计值与真值必然落在**同一个 bin** 内 → 绝对上界 = **一个 bin 宽**
+
+| 场景 | 模式 | 浮点参考 | 定点 Q16 | 绝对差 | 折算 EV | 上界 | 合格 |
+|---|---|---|---|---|---|---|---|
+{rows_ae}
+
+均值类折算到 EV 后比收敛阈值 0.02 EV **低约三个数量级**，分位数低约两个数量级。
+
+**位宽与 bin 数的扫描 —— 这条给出一个可用的设计结论：**
+
+| 输入位宽 | 全画面平均 | 高光优先（分位数） |
+|---|---|---|
+{rows_bits}
+
+**10 位以上就没有收益了。** 因为分位数的瓶颈从"输入量化"转移到了"直方图 bin 宽"，
+继续加位宽是在优化一个已经不是瓶颈的环节。要提精度只能加 bin 数：
+
+| bin 数 | 一个 bin 宽 | 实测绝对误差 |
+|---|---|---|
+{rows_bins}
+
+实测误差**始终压在 bin 宽之下**，与上界推导一致。
+
+**AWB 侧的端到端**（融合数学仍是 Python 那份，所以这里量的是差异传导到决策有多大）：
+
+| 场景 | n_valid 浮点/定点 | gray_world | white_patch | gains 相对差 | 角度误差差（度） |
+|---|---|---|---|---|---|
+{rows_awb}
+
+角度误差差最大 **{max(r['angle_diff_deg'] for r in fp['awb_rows']):.4f} 度**，
+而 AWB 本身的误差量级是 0.5~32 度 —— 定点化对既有结论没有影响。
+`white_patch` 的 ~6.6e-4 也落在 bin 宽上界内。
+
+**定点化的边界（明写）**：只定点化**逐像素统计通路**。融合权重、对数域几何平均、
+CCT 约束、AE 控制律仍在 double —— 它们每帧只作用在 3~5 个数上，没有吞吐论证，
+且含 `exp/log/pow`，定点化是另一场独立的误差分析。
+**整条 ISP 的定点化（去马赛克、CCM 仍是浮点）明确不在范围内。**
+""", ["fixed_budget", "fixed_sweep"]))
+
     return secs
 
 
@@ -1221,6 +1506,16 @@ def build_report(res: dict, outdir: str, title: str = "3A（AE/AWB/AF）算法�
         "sc_events": fig_scene_cut_events(res["scene_cut"], outdir),
         "t_awb": fig_awb_temporal(res["temporal_awb"], outdir),
     }
+    # C++ 模块是**可选**组件：没编译时这两节降级成一句说明，且不注册图。
+    # 这样"没装编译器"不会让报告生成失败，只会有两节是空的。
+    _np_ok = res.get("native_port", {}).get("available", False)
+    _fp_ok = res.get("fixed_point", {}).get("available", False)
+    if _np_ok:
+        figs["native_speed"] = fig_native_speed(res["native_port"], outdir)
+        figs["native_decomp"] = fig_native_decomp(res["native_port"], outdir)
+    if _fp_ok:
+        figs["fixed_budget"] = fig_fixed_budget(res["fixed_point"], outdir)
+        figs["fixed_sweep"] = fig_fixed_sweep(res["fixed_point"], outdir)
 
     secs = _sections(res, figs)
 

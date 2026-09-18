@@ -32,6 +32,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # C++ 统计库是可选组件，但**在 CI 里必须编出来** —— 否则测试是条件注册的，
+      # 会静默变少却仍然全绿。这是防「假绿」的唯一护栏。
+      - name: 编译 C++ 统计库
+        run: |
+          python tools/build_native.py --print-cmd
+          python tools/build_native.py --with-bench
+
+      - name: 断言共享库可加载（硬 gate）
+        run: python tools/build_native.py --check
+
+      - name: C++ 独立自检（不经过 Python）
+        run: ./native/build/aaa_native --self-test
+
       - name: 单元测试
         run: pytest -v
 

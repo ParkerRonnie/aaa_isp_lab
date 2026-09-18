@@ -154,62 +154,95 @@ def constrain_to_planckian(illum: np.ndarray, cfg: AWBConfig, win: float = 3.0):
 # -----------------------------------------------------------------------------
 # 主估计器
 # -----------------------------------------------------------------------------
+@dataclass
+class AWBStatistics:
+    """AWB 的逐帧统计量 —— 后端无关的中间结果。
+
+    把它单独拎出来的目的：**融合数学不属于统计通路**。C++ 后端只产出这些
+    统计量，融合（置信度加权、对数域几何平均、普朗克约束）仍由 Python 执行，
+    两条通路共用同一份决策代码 —— 否则两边一定会漂移。
+    """
+    estimators: dict
+    n_valid: int
+    sat_mean: float
+    frac_ge: float = 0.0
+
+
+def compute_statistics(linear: np.ndarray, cfg: AWBConfig) -> AWBStatistics:
+    """numpy 实现（默认后端）。逐行搬自原 estimate()，保证逐位不变。"""
+    mask = valid_mask(linear, cfg)
+    n_valid = int(mask.sum())
+    if n_valid < 16:
+        return AWBStatistics(estimators={}, n_valid=n_valid, sat_mean=0.0)
+
+    sat_mean = float(np.mean(_saturation(linear[mask])))
+    est = {
+        "gray_world": gray_world(linear, mask, cfg),
+        "white_patch": white_patch(linear, mask, cfg),
+        "gray_edge": gray_edge(linear, mask, cfg),
+        "shades_of_gray": shades_of_gray(linear, mask, cfg),
+    }
+    frac_ge = 0.0
+    if cfg.method == "fusion":
+        gray = (0.2126 * linear[..., 0] + 0.7152 * linear[..., 1] + 0.0722 * linear[..., 2])
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(gx * gx + gy * gy)
+        frac_ge = float(np.mean(mask & (mag > cfg.gray_edge_thresh)
+                                & (_saturation(linear) < cfg.near_gray_sat_max)))
+    return AWBStatistics(estimators=est, n_valid=n_valid,
+                         sat_mean=sat_mean, frac_ge=frac_ge)
+
+
+def fuse_illuminants(st: AWBStatistics, cfg: AWBConfig,
+                     clipped_ratio: float = 0.0):
+    """融合数学（C 后端与 numpy 后端**共用这一份**）。返回 (illum, weights)。"""
+    est = st.estimators
+    if cfg.method != "fusion":
+        return est[cfg.method], {}
+
+    # --- 置信度：每种算法在什么场景下不可信 ---
+    # 灰世界：画面越彩，灰世界假设越不成立
+    w_gw = float(np.clip(np.exp(-2.5 * st.sat_mean), 0.05, 1.0))
+    # 白块：一旦有像素过曝，最亮点已经不是中性面（可能是高光/光源）
+    w_wp = float(np.clip(1.0 - clipped_ratio / max(cfg.clip_guard, 1e-6), 0.02, 1.0))
+    # 灰边：样本数不足时不可信
+    w_ge = float(np.clip(st.frac_ge / 0.03, 0.0, 1.0))
+
+    base = np.array(cfg.fusion_weights, dtype=np.float64)
+    w = np.array([w_gw, w_ge, w_wp]) * base
+    if w.sum() <= 1e-9:
+        w = base.copy()
+    w = w / w.sum()
+
+    # 在对数域做加权几何平均：光源是乘性量，算术平均会被异常值带偏
+    stack = np.stack([est["gray_world"] / est["gray_world"][1],
+                      est["gray_edge"] / est["gray_edge"][1],
+                      est["white_patch"] / est["white_patch"][1]], axis=0)
+    illum = np.exp(np.sum(w[:, None] * np.log(np.clip(stack, 1e-6, None)), axis=0))
+    illum = illum / illum[1]
+    weights = {"gray_world": float(w[0]), "gray_edge": float(w[1]),
+               "white_patch": float(w[2]), "sat_mean": st.sat_mean,
+               "gray_edge_frac": st.frac_ge}
+    return illum, weights
+
+
 class AWBEstimator:
-    def __init__(self, cfg: AWBConfig = None):
+    def __init__(self, cfg: AWBConfig = None, stats_fn=None):
         self.cfg = cfg or AWBConfig()
+        # 统计后端可注入：默认是上面的 numpy 实现（**同一个函数对象**，
+        # 所以默认路径按构造即逐位不变）；换成 C++ 后端时融合数学不变。
+        self._stats = stats_fn or compute_statistics
 
     def estimate(self, linear_pre_wb: np.ndarray, clipped_ratio: float = 0.0) -> AWBResult:
         cfg = self.cfg
-        mask = valid_mask(linear_pre_wb, cfg)
-        n_valid = int(mask.sum())
-        if n_valid < 16:
+        st = self._stats(linear_pre_wb, cfg)
+        if st.n_valid < 16:
             return AWBResult(illum_rgb=np.ones(3), gains=np.ones(3),
                              method=cfg.method, detail={"fallback": "有效像素不足"})
 
-        sat = _saturation(linear_pre_wb[mask])
-        sat_mean = float(np.mean(sat))
-
-        est = {
-            "gray_world": gray_world(linear_pre_wb, mask, cfg),
-            "white_patch": white_patch(linear_pre_wb, mask, cfg),
-            "gray_edge": gray_edge(linear_pre_wb, mask, cfg),
-            "shades_of_gray": shades_of_gray(linear_pre_wb, mask, cfg),
-        }
-
-        if cfg.method != "fusion":
-            illum = est[cfg.method]
-        else:
-            # --- 置信度：每种算法在什么场景下不可信 ---
-            # 灰世界：画面越彩，灰世界假设越不成立
-            w_gw = float(np.clip(np.exp(-2.5 * sat_mean), 0.05, 1.0))
-            # 白块：一旦有像素过曝，最亮点已经不是中性面（可能是高光/光源）
-            w_wp = float(np.clip(1.0 - clipped_ratio / max(cfg.clip_guard, 1e-6), 0.02, 1.0))
-            # 灰边：样本数不足时不可信
-            gx = cv2.Sobel(0.2126 * linear_pre_wb[..., 0] + 0.7152 * linear_pre_wb[..., 1]
-                           + 0.0722 * linear_pre_wb[..., 2], cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(0.2126 * linear_pre_wb[..., 0] + 0.7152 * linear_pre_wb[..., 1]
-                           + 0.0722 * linear_pre_wb[..., 2], cv2.CV_32F, 0, 1, ksize=3)
-            mag = np.sqrt(gx * gx + gy * gy)
-            frac_ge = float(np.mean(mask & (mag > cfg.gray_edge_thresh)
-                                    & (_saturation(linear_pre_wb) < cfg.near_gray_sat_max)))
-            w_ge = float(np.clip(frac_ge / 0.03, 0.0, 1.0))
-
-            base = np.array(cfg.fusion_weights, dtype=np.float64)
-            w = np.array([w_gw, w_ge, w_wp]) * base
-            if w.sum() <= 1e-9:
-                w = base.copy()
-            w = w / w.sum()
-
-            # 在对数域做加权几何平均：光源是乘性量，算术平均会被异常值带偏
-            stack = np.stack([est["gray_world"] / est["gray_world"][1],
-                              est["gray_edge"] / est["gray_edge"][1],
-                              est["white_patch"] / est["white_patch"][1]], axis=0)
-            illum = np.exp(np.sum(w[:, None] * np.log(np.clip(stack, 1e-6, None)), axis=0))
-            illum = illum / illum[1]
-
-            est["_weights"] = {"gray_world": float(w[0]), "gray_edge": float(w[1]),
-                               "white_patch": float(w[2]), "sat_mean": sat_mean,
-                               "gray_edge_frac": frac_ge}
+        illum, weights = fuse_illuminants(st, cfg, clipped_ratio)
+        est = st.estimators
 
         illum = np.clip(illum, 1e-6, None)
         illum = illum / illum[1]
@@ -228,10 +261,10 @@ class AWBEstimator:
         return AWBResult(illum_rgb=illum.astype(np.float32),
                          gains=gains.astype(np.float32),
                          method=cfg.method, cct=cct,
-                         weights=est.get("_weights", {}),
-                         detail={"estimators": {k: v.tolist() for k, v in est.items()
-                                                if not k.startswith("_")},
-                                 "n_valid": n_valid, "raw_cct": raw_cct})
+                         weights=weights,
+                         detail={"estimators": {k: np.asarray(v).tolist()
+                                                for k, v in est.items()},
+                                 "n_valid": st.n_valid, "raw_cct": raw_cct})
 
 
 def ideal_gains(true_temp_k: float) -> np.ndarray:

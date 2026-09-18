@@ -50,6 +50,16 @@ class AEStreamResult(AEResult):
 # -----------------------------------------------------------------------------
 # 测光
 # -----------------------------------------------------------------------------
+# 模式标签与高光目标抽成模块级常量（原本硬编码在 metering_metric 里）：
+# C++ 后端要产出与这里**完全一致**的返回结构，两边共用同一张表才不会漂移。
+_METER_LABELS = {
+    "average": "全画面平均",
+    "center": "中心加权",
+    "spot": "点测光（中央窗口）",
+    "evaluative": "分区评价测光（含高光保护）",
+    "highlight_priority": "高光优先（99 分位）",
+}
+_HIGHLIGHT_TARGET = 0.90
 def _zone_weights(h: int, w: int, zones, sigma: float) -> np.ndarray:
     zy, zx = zones
     yy, xx = np.mgrid[0:zy, 0:zx].astype(np.float32)
@@ -79,13 +89,13 @@ def metering_metric(frame, cfg: AEConfig, raw_linear_fallback: bool = False) -> 
     if cfg.metering == "average":
         metric = float(luma.mean())
         target = cfg.target_linear
-        detail = {"mode": "全画面平均"}
+        detail = {"mode": _METER_LABELS["average"]}
 
     elif cfg.metering == "center":
         wmap = _center_weight(h, w, cfg.center_weight)
         metric = float((luma * wmap).sum() / wmap.sum())
         target = cfg.target_linear
-        detail = {"mode": "中心加权"}
+        detail = {"mode": _METER_LABELS["center"]}
 
     elif cfg.metering == "spot":
         sh = max(1, int(h * cfg.spot_ratio))
@@ -93,7 +103,7 @@ def metering_metric(frame, cfg: AEConfig, raw_linear_fallback: bool = False) -> 
         y0, x0 = (h - sh) // 2, (w - sw) // 2
         metric = float(luma[y0:y0 + sh, x0:x0 + sw].mean())
         target = cfg.target_linear
-        detail = {"mode": "点测光（中央窗口）"}
+        detail = {"mode": _METER_LABELS["spot"]}
 
     elif cfg.metering == "evaluative":
         zy, zx = cfg.zones
@@ -117,15 +127,16 @@ def metering_metric(frame, cfg: AEConfig, raw_linear_fallback: bool = False) -> 
                 clip_zone += wmap[i, j] * cfrac
         metric = float(zsum / max(wsum, 1e-6))
         target = cfg.target_linear
-        detail = {"mode": "分区评价测光（含高光保护）", "clip_zone": float(clip_zone / max(wsum, 1e-6))}
+        detail = {"mode": _METER_LABELS["evaluative"],
+                  "clip_zone": float(clip_zone / max(wsum, 1e-6))}
 
     elif cfg.metering == "highlight_priority":
         # 用高分位数代表"高光"，目标是让最亮的那部分刚好不过曝。
         # 取 99 分位而不是 95：95 分位在亮背景占比大的画面里仍然偏低，
         # 会给出"整体过曝但高光没截断"的反直觉结果。
         metric = float(np.percentile(luma, 99))
-        target = 0.90
-        detail = {"mode": "高光优先（99 分位）"}
+        target = _HIGHLIGHT_TARGET
+        detail = {"mode": _METER_LABELS["highlight_priority"]}
 
     else:
         raise ValueError(cfg.metering)

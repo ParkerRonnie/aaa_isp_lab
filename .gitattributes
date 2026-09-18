@@ -2,3 +2,12 @@
 *.png binary
 *.pdf binary
 *.docx binary
+# C++ 编译产物（已在 .gitignore 里忽略，这里再加一道保险）
+*.dll binary
+*.so binary
+*.dylib binary
+*.exe binary
+*.a binary
+*.lib binary
+*.o binary
+*.obj binary

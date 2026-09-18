@@ -4,9 +4,10 @@
 
 ```bash
 pip install -e ".[dev]"     # 可编辑安装 + 测试/检查工具
-pytest                       # 跑单元测试（38 个）
+pytest                       # 跑单元测试（38 个 + 编译后 13 个 C 路径用例）
 aaa-isp-lab --fast           # 端到端跑一遍，约 45s
 aaa-isp-lab                  # 全量，约 4 分钟（时域那几个实验是逐帧序列，占大头）
+python tools/build_native.py # 可选：编译 C++ 统计库（不编也能跑）
 ```
 
 不安装也能跑（源码目录直接执行）：
@@ -53,6 +54,44 @@ src/aaa_isp_lab/
 - 算法：AE 在 `aaa/ae.py` 的 `metering_metric` 里加分支；
   AWB 在 `aaa/awb.py` 里加估计器并在 `fusion` 的置信度里给权重；
   AF 在 `aaa/af.py` 的 `focus_measure` 里加分支并登记到 `MEASURES`
+
+## C++ 模块（可选组件）
+
+`native/` 是 3A 统计通路的 C++ 实现，编成 `extern "C"` 共享库、由 ctypes 加载。
+**它完全是可选的** —— 不编译时项目跑纯 Python 路径，测试按能否加载条件注册。
+
+```bash
+python tools/build_native.py --with-bench   # 编译（需要 g++/clang++）
+python tools/build_native.py --check        # 校验可加载 + ABI 版本（CI 硬 gate）
+./native/build/aaa_native --self-test       # 23 项不依赖 numpy 的解析自检
+```
+
+### ABI 三条纪律
+
+1. **结构体只含定宽整型 / double / 指针**，且显式留 padding。C 侧用 `static_assert`
+   固化尺寸与偏移，Python 侧（`native/api.py`）在导入时再校验一遍 —— 两边任何一边
+   改了都会被立刻发现。
+2. **绝不跨边界传所有权**。句柄是不透明指针，析构在库内做（RAII 留在库里）。
+3. **绝不抛异常出边界**。每个导出函数都在 `try/catch` 里，错误一律用返回码表示。
+
+还有一条不是纪律但同样重要：**所有参数在 C 里校验**。ctypes 传错参数导致的段错误会
+直接杀掉宿主进程（pytest 直接挂），表现为"基础设施故障"而不是"测试失败" ——
+是 CI 里最难定位的一类红。
+
+### 编译选项的三条禁令
+
+- 不许 `-ffast-math`：会破坏 NaN 语义与逐位等价断言
+- 不许 `-march=native`：本地与 CI 的指令集不同，跨机性能数字就不可比了
+- 不许 OpenMP/多线程：与 numpy 的线程策略不可比，且引入不可复现的方差
+
+另外 Windows 上必须 `-static`（**不是**只要 `-static-libgcc -static-libstdc++`）——
+这个 MinGW 构建下 `std::string`/`std::vector`/异常处理还会拉进 `libwinpthread-1.dll`。
+
+### 性能数字不得作为测试断言
+
+`native/bench.py` 提供测量方法学（warmup + 重复 + 中位数/p10/p90/MAD + ctypes 地板）。
+**测试里绝不断言任何性能数字** —— 性能只能作为"数据 + 分散度 + 环境"呈现，
+不能作为 gate，否则就是在测随机数。可复现的是等价性与误差，不是耗时。
 
 ## 测试约定
 

@@ -15,8 +15,9 @@ from .config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
 from .sim import scene as SC
 from .sim.camera import SimCamera, ev_limits, flicker_banding_metric
 from .sim.sensor import SensorSim
-from .aaa.ae import AEController
-from .aaa.awb import AWBEstimator, AWBStabilizer, ideal_gains, illuminant_error_deg
+from .aaa.ae import AEController, metering_metric
+from .aaa.awb import (AWBEstimator, AWBStabilizer, compute_statistics, ideal_gains,
+                      illuminant_error_deg)
 from .color_science import rgb_to_cct_duv
 from .aaa import af as AF
 from .isp import modules as IM
@@ -1070,3 +1071,206 @@ def exp_awb_temporal(scfg, icfg, size, awb_cfg, temporal_cfg,
             "settle_thresh_deg": thr, "steady_window": [n_frames // 4, cut],
             # 无滤波基线的稳态误差，报告里用来对照"滤波有没有引入偏差"
             "baseline_angle_err_mean": base["angle_err_mean"]}
+
+
+# -----------------------------------------------------------------------------
+# 16. C++ 统计通路：性能对照与等价性
+# -----------------------------------------------------------------------------
+def _native_frames(scfg, icfg, size, ae_cfg, temp=5000.0):
+    """取一组**在各自 AE 收敛工作点上**的帧（不是随机曝光）。"""
+    scenes = [("color_chart", SC.color_chart(*size)),
+              ("natural", SC.natural_scene(*size, backlit=True)),
+              ("uniform", SC.uniform_scene(*size))]
+    out = []
+    for nm, sc in scenes:
+        cam = make_camera(sc, temp, scfg, icfg, seed=97)
+        ev = AEController(copy.deepcopy(ae_cfg)).run(
+            lambda e: cam.capture(ev=e, wb_gains=ideal_gains(temp)), ev0=-1.0).final_ev
+        out.append((nm, cam.capture(ev=ev, wb_gains=ideal_gains(temp))))
+    return out
+
+
+def exp_native_port(scfg, icfg, size, ae_cfg, awb_cfg, repeats=100, warmup=20):
+    """16. C++ 统计重写：2×2 因子对照（算法 × 实现）+ 定点第 5 格 + 等价性。
+
+    对照设计回答的是**两个不同的问题**，混在一起就会得出"用 C 更快"这种
+    似是而非的结论：
+        py_naive -> py_opt   算法改进值多少（同一门语言）
+        py_opt   -> c_opt    实现/语言值多少（同一套算法）
+        c_f64 作为"朴素 C"的反向检验：**朴素 C 未必赢 numpy**
+
+    **诚实条款**：如果 Δ实现 < 1（C 没赢），如实写出来。数值/访存类的小核在
+    numpy 的 SIMD 加缓存友好实现面前输掉很正常，那本身就是有信息量的结果。
+    """
+    from .native import backend, bench, loader, pyopt
+
+    st = loader.status()
+    if not st.get("available"):
+        return {"available": False, "reason": st.get("reason", "共享库不可用")}
+
+    frames = _native_frames(scfg, icfg, size, ae_cfg)
+    fr0 = frames[0][1]
+    linear0 = np.ascontiguousarray(fr0.linear_pre_wb, dtype=np.float32)
+    rcfg = AWBConfig(method="fusion")
+
+    py_opt_fn = pyopt.compute_statistics_opt
+    c_f64 = backend.awb_stats_fn("f64")
+    c_f32 = backend.awb_stats_fn("f32")
+    c_q16 = backend.awb_stats_fn("q16")
+
+    timing = {
+        "awb_py_naive": bench.measure(lambda: compute_statistics(linear0, rcfg), warmup, repeats),
+        "awb_py_opt": bench.measure(lambda: py_opt_fn(linear0, rcfg), warmup, repeats),
+        "awb_c_f64": bench.measure(lambda: c_f64(linear0, rcfg), warmup, repeats),
+        "awb_c_f32": bench.measure(lambda: c_f32(linear0, rcfg), warmup, repeats),
+        "awb_c_q16": bench.measure(lambda: c_q16(linear0, rcfg), warmup, repeats),
+    }
+    # AE 侧测两个模式：
+    #   average   —— **没有算法差异**（都是一次求和），所以它度量的是"纯语言差异"
+    #   evaluative—— C 侧有真改进（分区循环 + 缓存），但两边都没什么可省
+    # 这个对照比"故意写一份慢 C"更有说服力：它是真实的、不是构造出来的。
+    a_cfg = AEConfig(metering="evaluative")
+    c_meter = backend.metering_fn("evaluative", precision="f32")
+    timing["ae_py_naive"] = bench.measure(lambda: metering_metric(fr0, a_cfg), warmup, repeats)
+    timing["ae_c_f32"] = bench.measure(lambda: c_meter(fr0, a_cfg), warmup, repeats)
+    avg_cfg = AEConfig(metering="average")
+    c_avg = backend.metering_fn("average", precision="f32")
+    timing["ae_avg_py"] = bench.measure(lambda: metering_metric(fr0, avg_cfg), warmup, repeats)
+    timing["ae_avg_c"] = bench.measure(lambda: c_avg(fr0, avg_cfg), warmup, repeats)
+
+    floor = bench.null_call_floor()
+
+    equiv = []
+    for nm, fr in frames:
+        lin = np.ascontiguousarray(fr.linear_pre_wb, dtype=np.float32)
+        a = compute_statistics(lin, rcfg)
+        b = c_f64(lin, rcfg)
+        rel = {}
+        for k in ("gray_world", "white_patch", "gray_edge", "shades_of_gray"):
+            x = np.asarray(a.estimators[k], float)
+            y = np.asarray(b.estimators[k], float)
+            rel[k] = float(np.max(np.abs(x - y) / np.maximum(np.abs(x), 1e-12)))
+        equiv.append({
+            "scene": nm,
+            "n_valid_equal": bool(a.n_valid == b.n_valid),
+            "sat_mean_rel": float(abs(a.sat_mean - b.sat_mean) / max(abs(a.sat_mean), 1e-12)),
+            "frac_ge_abs": float(abs(a.frac_ge - b.frac_ge)),
+            **{f"{k}_rel": v for k, v in rel.items()},
+        })
+
+    t = {k: v["median_us"] for k, v in timing.items()}
+    safe = lambda x: max(x, 1e-9)                                       # noqa: E731
+    decomp = {
+        "algo_gain_awb": t["awb_py_naive"] / safe(t["awb_py_opt"]),
+        "impl_gain_awb": t["awb_py_opt"] / safe(t["awb_c_f32"]),
+        "total_gain_awb": t["awb_py_naive"] / safe(t["awb_c_f32"]),
+        "impl_gain_ae_evaluative": t["ae_py_naive"] / safe(t["ae_c_f32"]),
+        # ★ 最能说明问题的一行：在**没有算法差异**的模式上换语言只值多少。
+        # 把它和上面的 9.2 倍并排看，就能判断"加速来自语言还是来自算法"。
+        "language_only_gain": t["ae_avg_py"] / safe(t["ae_avg_c"]),
+    }
+    npx = int(linear0.shape[0] * linear0.shape[1])
+    budget = {
+        "frame_budget_pct": bench.frame_budget_pct(t["awb_c_f32"]),
+        "extrap_1080p_us": bench.extrapolate_us(t["awb_c_f32"], npx, 1920 * 1080),
+        "extrap_4k_us": bench.extrapolate_us(t["awb_c_f32"], npx, 3840 * 2160),
+    }
+    return {"available": True, "env": bench.environment(), "timing": timing,
+            "null_call": floor, "null_call_us": floor["median_us"],
+            "equivalence": equiv, "decomposition": decomp, "budget": budget,
+            "size": list(size), "repeats": int(repeats), "warmup": int(warmup)}
+
+
+# -----------------------------------------------------------------------------
+# 17. 定点化误差预算
+# -----------------------------------------------------------------------------
+def exp_fixed_point(scfg, icfg, size, ae_cfg, awb_cfg, repeats=50):
+    """17. 定点化误差：误差分解 + 位宽/bin 扫描 + AE/AWB 端到端。
+
+    顺序统计量的误差用**三条路**分解，这样每一项都能归因到单一变量：
+        float64 + partition   numpy 现状（金标准）
+        float64 + 直方图       隔离"直方图估计器"本身的误差（与 C 无关，纯 Python 可算）
+        Q16 + 直方图          隔离"纯定点化"的误差（C）
+    于是 |p99_q16 − p99_numpy| ≤ |p99_hist64 − p99_numpy| + |p99_q16 − p99_hist64|。
+    """
+    from .native import backend, loader
+
+    st = loader.status()
+    if not st.get("available"):
+        return {"available": False, "reason": st.get("reason", "共享库不可用")}
+
+    frames = _native_frames(scfg, icfg, size, ae_cfg)
+    rcfg = AWBConfig(method="fusion")
+    MODES = ("average", "center", "spot", "evaluative", "highlight_priority")
+
+    # --- (a) AE 定点误差：逐模式绝对差 + 折算 EV ---
+    ae_rows = []
+    for nm, fr in frames:
+        for mode in MODES:
+            cfg = AEConfig(metering=mode)
+            ref = metering_metric(fr, cfg)["metric"]
+            fp = float(fr.clipped_ratio)
+            q = backend.metering_fn(mode, precision="q16")(fr, cfg)["metric"]
+            d = abs(ref - q)
+            ae_rows.append({
+                "scene": nm, "mode": mode, "ref": ref, "q16": q, "abs_diff": d,
+                "ev": d / max(ref, 1e-9) / np.log(2.0),
+                # 分位数走直方图，上界是一个 bin 宽；均值类上界 1.8e-5
+                "bound": 9.77e-4 if mode == "highlight_priority" else 1.8e-5,
+                "clip_ratio": fp,
+            })
+
+    # --- (b) AWB 定点误差：逐通道 + 端到端角度 ---
+    awb_rows = []
+    q_fn = backend.awb_stats_fn("q16")
+    for nm, fr in frames:
+        lin = np.ascontiguousarray(fr.linear_pre_wb, dtype=np.float32)
+        a = compute_statistics(lin, rcfg)
+        b = q_fn(lin, rcfg)
+        r1 = AWBEstimator(AWBConfig(method="fusion")).estimate(
+            fr.linear_pre_wb, fr.clipped_ratio)
+        r2 = AWBEstimator(AWBConfig(method="fusion"), stats_fn=q_fn).estimate(
+            fr.linear_pre_wb, fr.clipped_ratio)
+        awb_rows.append({
+            "scene": nm,
+            "n_valid_ref": a.n_valid, "n_valid_q16": b.n_valid,
+            "gray_world_abs": float(np.max(np.abs(np.asarray(a.estimators["gray_world"], float)
+                                                  - np.asarray(b.estimators["gray_world"], float)))),
+            "white_patch_abs": float(np.max(np.abs(np.asarray(a.estimators["white_patch"], float)
+                                                   - np.asarray(b.estimators["white_patch"], float)))),
+            "gains_rel": float(np.max(np.abs(np.asarray(r1.gains, float)
+                                             - np.asarray(r2.gains, float))
+                                      / np.maximum(np.abs(r1.gains), 1e-12))),
+            "angle_diff_deg": float(abs(illuminant_error_deg(r2.illum_rgb, 5000.0)
+                                        - illuminant_error_deg(r1.illum_rgb, 5000.0))),
+        })
+
+    # --- (c) 位宽扫描（AE average 与 highlight 各一条）---
+    by_bits = []
+    fr0 = frames[0][1]
+    for bits in (8, 10, 12, 14, 16):
+        row = {"bits": bits}
+        for mode in ("average", "highlight_priority"):
+            cfg = AEConfig(metering=mode)
+            ref = metering_metric(fr0, cfg)["metric"]
+            got = float(backend.metering_fn(mode, precision="q16",
+                                            bit_depth=bits)(fr0, cfg)["metric"])
+            row[f"{mode}_abs"] = abs(ref - got)
+        by_bits.append(row)
+
+    # --- (d) bin 数扫描（分位数）---
+    by_bins = []
+    for bins in (64, 256, 1024, 4096):
+        cfg = AEConfig(metering="highlight_priority")
+        ref = metering_metric(fr0, cfg)["metric"]
+        got = float(backend.metering_fn("highlight_priority", precision="q16",
+                                        hist_bins=bins)(fr0, cfg)["metric"])
+        by_bins.append({"bins": bins, "abs": abs(ref - got),
+                        "bin_width": 1.0 / bins})
+
+    return {"available": True, "ae_rows": ae_rows, "awb_rows": awb_rows,
+            "by_bits": by_bits, "by_bins": by_bins, "size": list(size),
+            "ref_numpy": np.__version__,
+            # 定点化的边界，报告里明写
+            "scope": "只定点化逐像素统计通路；融合权重、对数域几何平均、CCT 约束、"
+                     "AE 控制律仍在 double"}

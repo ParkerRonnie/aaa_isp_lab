@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aaa-isp-lab"
-version = "0.2.0"
+version = "0.3.0"
 description = "3A（AE/AWB/AF）算法与 ISP 画质调优实验平台：从物理建模到量化评价的完整仿真链路"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -43,6 +43,11 @@ Repository = "https://github.com/ParkerRonnie/aaa_isp_lab"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# C++ 共享库是**可选**组件（python tools/build_native.py 现场编译，不进 git）。
+# 这一行是为了让"已经编出来的库"在 pip 安装时被一起打包；库不存在也不报错。
+[tool.setuptools.package-data]
+"aaa_isp_lab.native" = ["*.dll", "*.so", "*.dylib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

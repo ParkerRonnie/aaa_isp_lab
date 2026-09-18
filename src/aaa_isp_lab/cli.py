@@ -32,6 +32,10 @@ def run(argv=None) -> dict:
         description="3A（AE/AWB/AF）算法与 ISP 画质调优实验平台")
     ap.add_argument("--fast", action="store_true", help="快速模式（小图、少重复）")
     ap.add_argument("--out", default="out", help="输出目录（默认 out/）")
+    ap.add_argument("--no-native", action="store_true",
+                    help="跳过 C++/定点两节（共享库不可用时自动跳过）")
+    ap.add_argument("--bench-repeats", type=int, default=None,
+                    help="性能测量的重复次数（默认 100，--fast 时 30）")
     args = ap.parse_args(argv)
 
     size = (256, 192) if args.fast else (480, 360)
@@ -80,6 +84,15 @@ def run(argv=None) -> dict:
         ("AWB 时域稳定", lambda: EX.exp_awb_temporal(
             scfg, icfg, size, awb_cfg, tcfg, n_frames=t16)),
     ]
+    bench_repeats = args.bench_repeats or (30 if args.fast else 100)
+    if not args.no_native:
+        steps += [
+            ("C++ 统计通路", lambda: EX.exp_native_port(
+                scfg, icfg, size, ae_cfg, awb_cfg,
+                repeats=bench_repeats, warmup=10 if args.fast else 20)),
+            ("定点化误差", lambda: EX.exp_fixed_point(
+                scfg, icfg, size, ae_cfg, awb_cfg)),
+        ]
     R = {}
     for name, fn in steps:
         t = time.time()
@@ -109,6 +122,12 @@ def run(argv=None) -> dict:
         "scene_cut": R["场景切换检测"],
         "temporal_awb": R["AWB 时域稳定"],
     }
+    if not args.no_native:
+        res["native_port"] = R["C++ 统计通路"]
+        res["fixed_point"] = R["定点化误差"]
+    else:
+        res["native_port"] = {"available": False, "reason": "本次运行用 --no-native 跳过"}
+        res["fixed_point"] = {"available": False, "reason": "本次运行用 --no-native 跳过"}
     # n_captures 必须**在全部实验跑完之后**再读：上面 res 字典里的 exp_isp 和
     # exp_ae_flicker 是内联调用的，执行顺序在 meta 之后 —— 原先在字典字面量里读
     # 会漏掉这两个实验的成像次数（实测少算 13 次），报告里的数字和实际不符。
