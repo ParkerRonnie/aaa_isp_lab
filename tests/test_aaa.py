@@ -16,19 +16,19 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from src.config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
-from src.eval.metrics import delta_e_2000, psnr, ssim, ideal_linear
-from src.color_science import (blackbody_linear_rgb, rgb_to_cct_duv, cct_to_xy,
+from aaa_isp_lab.config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
+from aaa_isp_lab.eval.metrics import delta_e_2000, psnr, ssim, ideal_linear
+from aaa_isp_lab.color_science import (blackbody_linear_rgb, rgb_to_cct_duv, cct_to_xy,
                                xy_to_cct, rgb_linear_to_lab, linear_to_srgb)
-from src.isp import modules as IM
-from src.sim import scene as SC
-from src.sim.camera import SimCamera, ev_limits, split_exposure, flicker_banding_metric
-from src.sim.optics import defocus_kernel
-from src.aaa.ae import AEController, metering_metric
-from src.aaa.awb import AWBEstimator, ideal_gains, illuminant_error_deg
-from src.aaa import af as AF
+from aaa_isp_lab.isp import modules as IM
+from aaa_isp_lab.sim import scene as SC
+from aaa_isp_lab.sim.camera import SimCamera, ev_limits, split_exposure, flicker_banding_metric
+from aaa_isp_lab.sim.optics import defocus_kernel
+from aaa_isp_lab.aaa.ae import AEController, metering_metric
+from aaa_isp_lab.aaa.awb import AWBEstimator, ideal_gains, illuminant_error_deg
+from aaa_isp_lab.aaa import af as AF
 
 W, H = 192, 144
 SCFG = SensorConfig(width=W, height=H)
@@ -113,7 +113,7 @@ def test_demosaic_constant_image():
 @case
 def test_srgb_transfer_roundtrip():
     x = np.linspace(0, 1, 64)
-    from src.color_science import srgb_to_linear
+    from aaa_isp_lab.color_science import srgb_to_linear
     back = srgb_to_linear(linear_to_srgb(x))
     assert np.max(np.abs(back - x)) < 1e-9
 
@@ -184,7 +184,7 @@ def test_defocus_psf_is_smooth_in_radius():
 @case
 def test_flicker_banding_metric():
     """带纹指标：曝光时间落在纹波周期整数倍上时，带纹必须消失"""
-    from src.sim.camera import apply_flicker_banding
+    from aaa_isp_lab.sim.camera import apply_flicker_banding
     base = np.full((H, W), 1000.0, dtype=np.float32)
     bad = apply_flicker_banding(base.copy(), 1 / 180.0, 50.0, 0.02, 64.0, 0.25)
     good = apply_flicker_banding(base.copy(), 0.01, 50.0, 0.02, 64.0, 0.25)  # 10ms = 整数倍
@@ -251,7 +251,7 @@ def test_awb_ideal_gains_neutralize():
     sc = SC.color_chart(W, H)
     cam = SimCamera(sc, 3000.0, SCFG, ICFG, seed=5)
     fr = cam.capture(ev=0.0)
-    from src.eval.metrics import neutral_chroma
+    from aaa_isp_lab.eval.metrics import neutral_chroma
     masks = sc.patch_masks
     ideal = ideal_linear(sc, 3000.0)
 
@@ -278,7 +278,7 @@ def test_awb_estimator_normalization_and_masks():
         assert abs(float(est.gains[1]) - 1.0) < 1e-6, method
         assert np.all(est.gains > 0), method
 
-    from src.aaa.awb import valid_mask
+    from aaa_isp_lab.aaa.awb import valid_mask
     m = valid_mask(fr.linear_pre_wb, AWBConfig())
     assert not m[0, 0] or True      # 掩码本身不该全是 False
     assert m.mean() > 0.1, "有效像素比例过低，掩码条件过严"

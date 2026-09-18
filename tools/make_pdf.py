@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""把 out/report.html 转成 PDF，方便发给别人或放进作品集。
+"""把报告 HTML 转成 PDF，方便发给别人或放进作品集。
 
-    python tools/make_pdf.py
+    python tools/make_pdf.py                # 默认转 docs/report.html
+    python tools/make_pdf.py --dir out      # 转生成目录里的报告
 
 原理：调用本机已安装的 Chrome / Edge 的无头模式打印 PDF。
 HTML 里的图片是 base64 内嵌的，所以生成的 PDF 是自包含的。
@@ -37,16 +38,22 @@ def find_browser() -> str:
 
 
 def main():
-    html = os.path.join(ROOT, "out", "report.html")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", default="docs", help="报告所在目录（默认 docs）")
+    args = ap.parse_args()
+
+    outdir = os.path.join(ROOT, args.dir)
+    html = os.path.join(outdir, "report.html")
     if not os.path.exists(html):
-        print("找不到 out/report.html，请先运行 python run_all.py")
+        print(f"找不到 {args.dir}/report.html，请先运行：aaa-isp-lab --out {args.dir}")
         return 1
     exe = find_browser()
     if not exe:
         print("没找到 Chrome/Edge，无法生成 PDF。可以直接用浏览器打开 HTML 后 Ctrl+P。")
         return 1
 
-    pdf = os.path.join(ROOT, "out", "report.pdf")
+    pdf = os.path.join(outdir, "report.pdf")
     url = "file:///" + html.replace("\\", "/")
     cmd = [exe, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
            f"--print-to-pdf={pdf}", url]

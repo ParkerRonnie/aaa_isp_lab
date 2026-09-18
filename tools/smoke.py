@@ -4,17 +4,17 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import numpy as np
 
-from src.config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
-from src.sim import scene as S
-from src.sim.camera import SimCamera
-from src.aaa.ae import AEController, metering_metric
-from src.aaa.awb import AWBEstimator, ideal_gains, illuminant_error_deg
-from src.aaa import af as AF
-from src.eval import metrics as MT
+from aaa_isp_lab.config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
+from aaa_isp_lab.sim import scene as S
+from aaa_isp_lab.sim.camera import SimCamera
+from aaa_isp_lab.aaa.ae import AEController, metering_metric
+from aaa_isp_lab.aaa.awb import AWBEstimator, ideal_gains, illuminant_error_deg
+from aaa_isp_lab.aaa import af as AF
+from aaa_isp_lab.eval import metrics as MT
 
 W, H = 320, 240
 scfg = SensorConfig(width=W, height=H)
@@ -55,7 +55,7 @@ for m in ("gray_world", "white_patch", "gray_edge", "shades_of_gray", "fusion"):
 
 # --- 色彩指标 ---
 ideal = MT.ideal_linear(scenes["color_chart"], 5000.0)
-from src.isp.modules import apply_wb
+from aaa_isp_lab.isp.modules import apply_wb
 d_before = MT.neutral_chroma(fr.linear_ccm, scenes["color_chart"].neutral_mask)
 wb = apply_wb(fr.linear_pre_wb, ideal_gains(5000.0))
 d_after = MT.neutral_chroma(wb, scenes["color_chart"].neutral_mask)
@@ -64,13 +64,13 @@ print("     ΔE00(理想WB) =", round(float(np.mean(MT.patch_delta_e(
     wb, ideal, scenes["color_chart"].patch_masks))), 3))
 
 # --- CCM 标定 ---
-from src.isp.modules import solve_ccm
+from aaa_isp_lab.isp.modules import solve_ccm
 masks = scenes["color_chart"].patch_masks
 src = np.stack([wb[m].mean(axis=0) for m in masks])
 dst = np.stack([ideal[m].mean(axis=0) for m in masks])
 ccm = solve_ccm(src, dst)
 print("[ok] CCM 标定\n", np.round(ccm, 4))
-from src.isp.modules import apply_ccm
+from aaa_isp_lab.isp.modules import apply_ccm
 print("     ΔE00(标定后) =", round(float(np.mean(MT.patch_delta_e(
     apply_ccm(wb, ccm), ideal, masks))), 3))
 
