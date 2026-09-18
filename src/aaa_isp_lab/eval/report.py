@@ -399,6 +399,193 @@ def _b64(path: str) -> str:
         return base64.b64encode(f.read()).decode("ascii")
 
 
+# -----------------------------------------------------------------------------
+# 时域（抖动源 / 权衡 / 场景切换 / AWB 稳定）
+# -----------------------------------------------------------------------------
+def fig_temporal_source(res: dict, outdir: str) -> str:
+    rows = res["rows"]
+    regimes = []
+    for r in rows:
+        if r["regime"] not in regimes:
+            regimes.append(r["regime"])
+
+    fig, axes = plt.subplots(1, len(regimes), figsize=(6.0 * len(regimes), 4.2))
+    if len(regimes) == 1:
+        axes = [axes]
+    for ax, reg in zip(axes, regimes):
+        sub = [r for r in rows if r["regime"] == reg]
+        labels = [r["label"].replace("（噪声地板）", "") for r in sub]
+        vals = [max(r["jitter_metric_std"], 1e-9) for r in sub]
+        colors = [C_GRAY if r["source"] == "S0" else
+                  (C_OK if r["floor_ratio"] >= 20.0 else C_WARN) for r in sub]
+        ax.barh(range(len(sub)), vals, color=colors)
+        ax.set_yticks(range(len(sub)))
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xscale("log")
+        ax.set_xlabel("稳态抖动 std（EV，对数轴）")
+        ax.set_title(f"{reg}：噪声地板 {sub[0]['floor']:.1e} EV")
+        ax.grid(alpha=0.3, axis="x")
+        for i, r in enumerate(sub):
+            ax.text(vals[i], i, f"  {r['floor_ratio']:.1f}×", va="center", fontsize=8)
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_temporal_source.png")
+
+
+def fig_temporal_tradeoff(res: dict, outdir: str) -> str:
+    rows = res["rows"]
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
+
+    ax = axes[0]
+    for r in rows:
+        if r["settle_frames"] < 0:
+            ax.scatter(0, r["jitter_ev_cmd_std"], s=60, color=C_WARN, marker="x", zorder=3)
+            ax.annotate(r["label"] + "（未收敛）", (0, r["jitter_ev_cmd_std"]),
+                        textcoords="offset points", xytext=(6, 4), fontsize=7.5)
+            continue
+        ok = r["pareto_optimal"]
+        ax.scatter(r["settle_frames"], r["jitter_ev_cmd_std"],
+                   s=110 if ok else 55, color=C_OK if ok else C_MAIN,
+                   marker="*" if ok else "o", zorder=3,
+                   edgecolor="k", linewidth=0.4)
+        ax.annotate(r["label"].replace("（检测器关）", ""),
+                    (r["settle_frames"], r["jitter_ev_cmd_std"]),
+                    textcoords="offset points", xytext=(6, 6), fontsize=7.5)
+    ax.set_xlabel("场景切换后重收敛帧数（越左越好）")
+    ax.set_ylabel("稳态曝光抖动 std（EV，越下越好）")
+    ax.set_title("抖动-延迟平面：★ = 帕累托最优")
+    ax.grid(alpha=0.3)
+
+    ax = axes[1]
+    pairs, labels = [], []
+    for r in rows:
+        if not r["detector"] or r["adaptive"]:
+            continue
+        mate = next((o for o in rows if not o["detector"]
+                     and abs(o["alpha_slow"] - r["alpha_slow"]) < 1e-9), None)
+        if mate is None:
+            continue
+        labels.append(f"alpha={r['alpha_slow']:.1f}")
+        pairs.append((mate["settle_frames"], r["settle_frames"]))
+    if pairs:
+        x = np.arange(len(pairs))
+        off = [p[0] for p in pairs]
+        on = [p[1] for p in pairs]
+        ax.bar(x - 0.19, off, 0.38, label="检测器关", color=C_WARN)
+        ax.bar(x + 0.19, on, 0.38, label="检测器开", color=C_OK)
+        for i, (a, b) in enumerate(zip(off, on)):
+            ax.text(i - 0.19, a, str(a), ha="center", va="bottom", fontsize=9)
+            ax.text(i + 0.19, b, str(b), ha="center", va="bottom", fontsize=9)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+    ax.set_ylabel("重收敛帧数")
+    ax.set_title("检测器的贡献：延迟直降、抖动不变\n（同一 alpha 成对比较）")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_temporal_tradeoff.png")
+
+
+def fig_temporal_trace(res: dict, outdir: str) -> str:
+    rows = res["rows"]
+    pick = [r for r in rows if r["label"].startswith("无滤波")]
+    pick += [r for r in rows if "alpha=0.4" in r["label"]]
+    fig, ax = plt.subplots(figsize=(11, 4.0))
+    for r in pick:
+        ax.plot(range(len(r["ev_hist"])), r["ev_hist"], "-", lw=1.5, label=r["label"])
+    ax.axvline(res["cut_frame"], color="k", ls="--", lw=1, alpha=0.7)
+    ax.set_xlabel("帧序号")
+    ax.set_ylabel("曝光 EV")
+    ax.set_title("内容切换后的重收敛：无滤波过冲振荡，检测器一开立刻松手")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_temporal_trace.png")
+
+
+def fig_scene_cut_signal(res: dict, outdir: str) -> str:
+    names = ["d_metric_ev", "texture_ratio", "hist_dist"]
+    th = res["thresholds"]
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.8))
+    for ax, k in zip(axes, names):
+        smax = res["static_max"][k]
+        cmin = res["cut_min"][k]
+        vals = [smax, cmin, th[k]]
+        ax.bar(["静止最坏", "切换最小", "门限"], vals, color=[C_WARN, C_OK, C_GRAY])
+        for i, v in enumerate(vals):
+            ax.text(i, v, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+        ax.set_yscale("symlog", linthresh=1e-3)
+        ax.set_title(f"{k}\n分离度 {res['separation'][k]:.1f}×")
+        ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_scene_cut_signal.png")
+
+
+def fig_scene_cut_events(res: dict, outdir: str) -> str:
+    cuts = res["cuts"]
+    labels = [f"{c['event']}\nseed={c['seed']}" for c in cuts]
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4),
+                             gridspec_kw={"width_ratios": [1.35, 1]})
+
+    ax = axes[0]
+    x = np.arange(len(cuts))
+    ax.bar(x - 0.26, [c["d_metric_ev"] for c in cuts], 0.26,
+           label="d_metric_ev", color=C_MAIN)
+    ax.bar(x, [c["hist_dist"] for c in cuts], 0.26, label="hist_dist", color=C_OK)
+    ax.bar(x + 0.26, [c["texture_ratio"] for c in cuts], 0.26,
+           label="texture_ratio", color=C_WARN)
+    ax.axhline(res["thresholds"]["d_metric_ev"], color=C_MAIN, ls=":", lw=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=7, rotation=18)
+    for i, c in enumerate(cuts):
+        ax.text(i, -0.14, "检出" if c["detected"] else "漏检", ha="center", fontsize=8,
+                color=C_OK if c["detected"] else C_WARN)
+    ax.set_title("各切换事件上的信号值（虚线 = d_metric 门限）")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+
+    ax = axes[1]
+    lab = ["误触发率", "检出率", "分类准确率"]
+    val = [res["false_trigger_rate"], res["detect_rate"], res["kind_accuracy"]]
+    ax.bar(lab, val, color=[C_OK, C_MAIN, C_OK])
+    for i, v in enumerate(val):
+        ax.text(i, v, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
+    ax.set_ylim(0, 1.18)
+    ax.set_ylabel("比率")
+    ax.set_title(f"静止 {res['n_static_runs']} 组 / 切换 {res['n_cut_runs']} 次\n"
+                 f"等亮度色温 {res['cct_equal_luma_detected']}/"
+                 f"{res['cct_equal_luma_total']}（已知边界）", fontsize=9)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_scene_cut_events.png")
+
+
+def fig_awb_temporal(res: dict, outdir: str) -> str:
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.0))
+    rows = res["rows"]
+
+    ax = axes[0]
+    ax.bar([r["label"] for r in rows], [r["gain_flicker"] for r in rows],
+           color=[C_WARN] + [C_MAIN] * (len(rows) - 1))
+    for i, r in enumerate(rows):
+        ax.text(i, r["gain_flicker"], f"{r['gain_flicker']:.5f}",
+                ha="center", va="bottom", fontsize=8.5)
+    ax.set_ylabel("增益跳动 mean|d log2(gain)|")
+    ax.set_title("颜色呼吸：逐帧独立估计 vs 对数域时域稳定")
+    ax.grid(alpha=0.3, axis="y")
+
+    ax = axes[1]
+    for r in rows:
+        ax.plot(range(len(r["err_hist"])), r["err_hist"], "-", lw=1.4, label=r["label"])
+    ax.axvline(res["cut_frame"], color="k", ls="--", lw=1, alpha=0.7)
+    ax.set_xlabel("帧序号")
+    ax.set_ylabel("光源角度误差（度）")
+    ax.set_title("误差均值不随滤波变差（平滑不引入偏差）", fontsize=9.5)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    return _save(fig, outdir, "fig_awb_temporal.png")
+
+
 def _sections(res: dict, figs: dict) -> list:
     """返回 (标题, 说明 markdown, 图片 key 列表) 的列表。
 
@@ -739,7 +926,156 @@ LSC 必须在 RAW 域按 CFA 通道分别补偿 —— 阴影衰减是光子层�
         f'| {r["label"]} | {r["luma_uniformity"]:.3f} | {r["d_uv_corner_max"]:.2f} |'
         for r in iq["shading"]["rows"])
 
-    secs.append(("11. 画质指标：产品规格书上的那些数字", f"""
+    # ---- 12. 时域抖动源 ----
+    ts = res["temporal_source"]
+    rows_ts = "\n".join(
+        f"| {r['regime']} | {r['label']} | {r['jitter_metric_std']:.2e} | "
+        f"{r['floor_ratio']:.1f}× | "
+        f"{'是' if (r['source'] != 'S0' and r['floor_ratio'] >= ts['significant_ratio']) else '否'} |"
+        for r in ts["rows"])
+    secs.append(("12. 时域抖动从哪来：先测噪声地板，再谈滤波", f"""
+时域滤波是最容易"做得很漂亮但没意义"的一块，原因是一个必须先讲清楚的**负结论**。
+
+测光量是**整帧空间平均**：{ts['n_frames']} 帧序列上实测噪声地板只有
+**{ts['rows'][0]['jitter_metric_std']:.1e} EV**，比收敛阈值 0.02 EV 低约两个数量级。
+也就是说**静止场景下 AE 的抖动恒等于浮点噪声** —— 不存在"滤波把抖动降低 90%"
+这回事。低照度本身不产生抖动，它只是把执行器推到长曝光/高增益，**间接**放大量化步长。
+
+所以扰动必须作为**显式的物理源**注入，而且每个源都要先证明它相对地板显著
+（门槛 {ts['significant_ratio']:.0f}×，{ts['n_significant']} 个源达标）：
+
+| 场景 | 扰动源 | 稳态抖动 std (EV) | 相对地板 | 显著 |
+|---|---|---|---|---|
+{rows_ts}
+
+三个源各有各的脾气，都不是"调个参数"能糊过去的：
+
+- **S1 光源强度波动**严格线性 —— 幅度 ×4，抖动也 ×4。它是真实场景里一直存在的那种。
+- **S2 闪烁相位漂移**只在**亮场景**显著。强度正比于 `sinc(f·ET)`：亮光下曝光时间短、
+  sinc 接近 1；暗光下曝光时间顶到上限，sinc 把它压掉了。这和前面抗闪烁那节是同一件事的两面。
+- **S3 执行器量化**是**确定性**的 —— 不需要任何噪声，抖动来自控制结构本身。
+  而且严格分域：亮场景增益被钳在 1.0，只有曝光时间量化起作用；暗场景曝光时间顶在上限，
+  抖动全部来自增益档位。台阶越大抖动越大（1/6 EV → 1/3 EV 单调上升）。
+
+**S3 才是真实 AE 必须做时域平滑的头号原因** —— 它不会因为光照变好而消失。
+""", ["t_source"]))
+
+    # ---- 13. AE 时域滤波与检测器 ----
+    ta = res["temporal_ae"]
+
+    def _pick(prefix, det):
+        return next((r for r in ta["rows"]
+                     if r["label"].startswith(prefix) and r["detector"] is det), None)
+
+    p4o, p4n = _pick("固定 alpha=0.4", False), _pick("固定 alpha=0.4", True)
+    p5o, p5n = _pick("固定 alpha=0.5", False), _pick("固定 alpha=0.5", True)
+    worst = max((r for r in ta["rows"] if r["settle_frames"] < 0),
+                key=lambda r: r["jitter_ev_cmd_std"], default=None)
+    rows_ta = "\n".join(
+        f"| {r['label']} | {r['jitter_ev_cmd_std']:.5f} | {r['jitter_metric_std']:.5f} | "
+        f"{r['settle_frames'] if r['settle_frames'] >= 0 else '**未收敛**'} | "
+        f"{'★' if r['pareto_optimal'] else ''} |"
+        for r in ta["rows"])
+    secs.append(("13. 时域滤波：在闭环里它不是免费午餐", f"""
+这一节的结论**与最初的设想相反**，按实测数据写。
+
+抖动源用 S1（0.5% 光源波动，上一节实测
+{max(r['floor_ratio'] for r in ts['rows'] if r['label'] == 'S1 光源波动 0.5%'):.0f}× 地板且严格线性）；
+在第 {ta['cut_frame']} 帧做内容切换，一条序列同时产出抖动与延迟。
+
+| 配置 | 稳态曝光抖动 std (EV) | 画面抖动 std (EV) | 重收敛帧数 | 帕累托 |
+|---|---|---|---|---|
+{rows_ta}
+
+**一、时域滤波并没有降低曝光抖动，开太狠反而失稳。**
+固定 alpha 的曝光抖动全都比不滤波（{ta['rows'][0]['jitter_ev_cmd_std']:.5f}）**更差**；
+alpha=0.2 时涨到 {_pick("固定 alpha=0.2", False)['jitter_ev_cmd_std']:.3f} EV，
+alpha=0.1 直接**未收敛**（{"曝光抖动 %.2f EV" % worst["jitter_ev_cmd_std"] if worst else ""}）。
+根因是这套 AE 是**变步长**的（大误差时 d=0.9，过曝补偿还能把它推到 1.0）——
+慢滤波的相位滞后叠加这个大环路增益，把闭环推向振荡。
+所以"滤波开大一点更稳"是错的：**滤波强度存在稳定边界**。
+
+**二、真正有价值的是场景切换检测器。** 同一滤波强度下成对比较：
+
+| 稳态滤波 | 检测器关 | 检测器开 | 曝光抖动 |
+|---|---|---|---|
+| alpha=0.5 | {p5o['settle_frames']} 帧 | **{p5n['settle_frames']} 帧** | 两行相同（{p5o['jitter_ev_cmd_std']:.5f}） |
+| alpha=0.4 | {p4o['settle_frames']} 帧 | **{p4n['settle_frames']} 帧** | 两行相同（{p4o['jitter_ev_cmd_std']:.5f}） |
+
+延迟直降，**抖动分毫不变** —— 这正是检测器存在的理由：
+它买到的是"切换瞬间立刻松手"，不牺牲稳态平滑。
+
+**三、自适应 alpha 规则下检测器是冗余的**（两行数值完全相同）——
+因为大误差本来就触发 fast。如实记录，不硬凑它有用。
+""", ["t_tradeoff", "t_trace"]))
+
+    # ---- 14. 场景切换检测 + AWB ----
+    sc = res["scene_cut"]
+    aw = res["temporal_awb"]
+    sig_names = ("d_metric_ev", "texture_ratio", "hist_dist")
+    rows_sep = "\n".join(
+        f"| `{k}` | {sc['thresholds'][k]:.3f} | {sc['static_max'][k]:.4f} | "
+        f"{sc['cut_min'][k]:.4f} | {sc['separation'][k]:.1f}× | "
+        f"{sc['margin_vs_thresh'][k]:.2f}× |"
+        for k in sig_names)
+    rows_cut = "\n".join(
+        f"| {c['event']} | {c['seed']} | {c['d_metric_ev']:.3f} | {c['hist_dist']:.3f} | "
+        f"{c['texture_ratio']:.3f} | {c['latency'] if c['detected'] else '未检出'} | "
+        f"{c['est_kind']} |"
+        for c in sc["cuts"])
+    rows_aw = "\n".join(
+        f"| {r['label']} | {r['gain_flicker']:.5f} | {r['angle_err_mean']:.4f} | "
+        f"{r['angle_err_std']:.4f} | {r['settle_frames']} |"
+        for r in aw["rows"])
+    secs.append(("14. 场景切换检测与 AWB 时域稳定", f"""
+**检测器怎么做的。** 三个逐帧信号投票（至少 2 票），全部从画面现算，不依赖真值：
+
+- `d_metric_ev`：**曝光归一化**后的测光量跳变。归一化是关键 —— 去掉它，
+  AE 自己收敛 3 EV 就会被当成一次场景切换。
+- `texture_ratio`：结构信号（带通能量占比）比值。对**亮度整体缩放严格不变**。
+- `hist_dist`：曝光归一化亮度直方图的距离。
+
+**门限由数据定，不靠猜。** 静止条件取最坏值、切换事件取最小值，门限落在中间：
+
+| 信号 | 门限 | 静止最坏 | 切换最小 | 分离度 | 门限裕度 |
+|---|---|---|---|---|---|
+{rows_sep}
+
+注意 `texture_ratio` 的门限裕度小于 1 —— **它在光照类事件上永远不会触发**。
+真正撑住检出的是 `d_metric_ev` 和 `hist_dist`。但 `texture_ratio` 另有重任：
+**只有它能区分"内容变了"和"光变了"**（`hist_dist` 对两类都敏感，拿它分类会把
+光照变化误判成内容变化）。实测分类准确率 **{sc['kind_accuracy']:.3f}**
+（{sc['kind_correct']}/{sc['kind_total']}）。
+
+| 事件 | seed | dM | hist | tex | 延迟(帧) | 判定类型 |
+|---|---|---|---|---|---|---|
+{rows_cut}
+
+**整体表现：** 静止 {sc['n_static_runs']} 组条件误触发 **{sc['n_static_fired']}** 次
+（含"让 AE 从 +3 EV 收敛"这条最要命的假阳性）；切换 {sc['n_cut_runs']} 次检出
+{sc['n_detected']} 次，检出的全部延迟为 0 帧。
+
+**已知边界（如实写）：** 等亮度色温切换检出
+{sc['cct_equal_luma_detected']}/{sc['cct_equal_luma_total']} —— 三个信号全都低于门限。
+这套检测器测的是**亮度与内容**变化，不是**色度**变化。要覆盖它得另加色度信号。
+
+**AWB 侧的对照：这里滤波是干净有效的。** 序列为 5000K 前 {aw['cut_frame']} 帧、
+之后切到 {aw['temp_b']:.0f}K，曝光固定在 {aw['ev_fix']:.2f} EV：
+
+| 配置 | 增益跳动 | 角度误差均值 | 误差 std | 重收敛 |
+|---|---|---|---|---|
+{rows_aw}
+
+增益跳动降 **{aw['rows'][0]['gain_flicker'] / max(aw['rows'][-1]['gain_flicker'], 1e-12):.1f} 倍**，
+而**角度误差均值几乎不变**（{aw['rows'][0]['angle_err_mean']:.4f} →
+{aw['rows'][-1]['angle_err_mean']:.4f}）—— 这是"平滑不引入偏差"的正面证据。
+
+**为什么 AWB 行而 AE 不行？** 结构不同：**AWB 是开环估计器**（逐帧独立、无反馈），
+滤波只做平均；**AE 是闭环控制**，滤波改变的是环路动态。同一种滤波方法，放在
+开环里是纯收益，放进闭环里就得先算稳定边界。
+""", ["sc_signal", "sc_events", "t_awb"]))
+
+    secs.append(("15. 画质指标：产品规格书上的那些数字", f"""
 前面十节都是"哪个算法更好"的内部对比。这一节回答的是另一类问题：
 **这台相机的画质到底是多少** —— MTF50、SNR、动态范围、色阴影。
 这些才是画质调优的通用语言，也是能和别人对齐的口径。
@@ -878,6 +1214,12 @@ def build_report(res: dict, outdir: str, title: str = "3A（AE/AWB/AF）算法�
         "iq_noise": fig_iq_noise(res["image_quality"], outdir),
         "iq_gain": fig_iq_gain(res["image_quality"], outdir),
         "iq_shading": fig_iq_shading(res["image_quality"], outdir),
+        "t_source": fig_temporal_source(res["temporal_source"], outdir),
+        "t_tradeoff": fig_temporal_tradeoff(res["temporal_ae"], outdir),
+        "t_trace": fig_temporal_trace(res["temporal_ae"], outdir),
+        "sc_signal": fig_scene_cut_signal(res["scene_cut"], outdir),
+        "sc_events": fig_scene_cut_events(res["scene_cut"], outdir),
+        "t_awb": fig_awb_temporal(res["temporal_awb"], outdir),
     }
 
     secs = _sections(res, figs)

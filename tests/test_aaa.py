@@ -18,7 +18,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from aaa_isp_lab.config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
+from aaa_isp_lab.config import (SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig,
+                                TemporalConfig)
 from aaa_isp_lab.eval.metrics import delta_e_2000, psnr, ssim, ideal_linear
 from aaa_isp_lab.color_science import (blackbody_linear_rgb, rgb_to_cct_duv, cct_to_xy,
                                xy_to_cct, rgb_linear_to_lab, linear_to_srgb)
@@ -27,9 +28,12 @@ from aaa_isp_lab.sim import scene as SC
 from aaa_isp_lab.sim.camera import SimCamera, ev_limits, split_exposure, flicker_banding_metric
 from aaa_isp_lab.sim.optics import defocus_kernel
 from aaa_isp_lab.aaa.ae import AEController, metering_metric
-from aaa_isp_lab.aaa.awb import AWBEstimator, ideal_gains, illuminant_error_deg
+from aaa_isp_lab.aaa.awb import (AWBEstimator, AWBStabilizer, ideal_gains,
+                                 illuminant_error_deg)
 from aaa_isp_lab.aaa import af as AF
+from aaa_isp_lab.aaa.temporal import EMAFilter, SceneCutDetector, structure_signal
 from aaa_isp_lab.eval import image_quality as IQ
+from aaa_isp_lab.eval import metrics as MT
 
 W, H = 192, 144
 SCFG = SensorConfig(width=W, height=H)
@@ -537,6 +541,202 @@ def test_gain_referred_model_lowers_dark_noise():
     # 读出噪声后置：16× 增益下暗噪声折算值必须明显下降
     assert noise["gain_referred"][1] < 0.7 * noise["gain_referred"][0], noise["gain_referred"]
 
+
+
+# -----------------------------------------------------------------------------
+# 时域
+# -----------------------------------------------------------------------------
+def _seq_camera(scene, seed=67, temp=5000.0):
+    cam = SimCamera(scene, temp, SCFG, ICFG, seed=seed)
+    return cam
+
+
+def _stream(cam, ae_cfg=None, tcfg=None, n=40, ev0=0.0, on_frame=None):
+    ctl = AEController(ae_cfg or AEConfig(), tcfg)
+    return ctl.run_stream(lambda ev: cam.capture(ev=ev, wb_gains=ideal_gains(5000.0)),
+                          ev0=ev0, n_frames=n, on_frame=on_frame)
+
+
+@case
+def test_run_stream_matches_run_without_filter():
+    """钉住 _observe() 重构：无滤波时 run_stream 的前缀必须与 run 逐位一致。
+
+    这是整块重构的安全网 —— 抽出 _observe() 时只要控制律有一行改动，
+    既有的 8 处调用点和全部历史结论就都不可比了。"""
+    sc = SC.natural_scene(W, H, backlit=True)
+    for ev0 in (3.0, -3.0):
+        cam1 = _seq_camera(sc, seed=7)
+        r1 = AEController(AEConfig()).run(
+            lambda ev: cam1.capture(ev=ev, wb_gains=ideal_gains(5000.0)), ev0=ev0)
+        r2 = _stream(_seq_camera(sc, seed=7), n=40, ev0=ev0)
+        n = len(r1.history)
+        assert n > 0
+        for a, b in zip(r1.history, r2.history[:n]):
+            assert abs(a["ev"] - b["ev"]) < 1e-15, f"ev0={ev0} EV 序列不一致"
+            assert abs(a["err_ev"] - b["err_ev"]) < 1e-15, f"ev0={ev0} 误差序列不一致"
+        assert r1.iters == n
+
+
+@case
+def test_structure_signal_matches_texture_acutance():
+    """结构信号与 eval 侧刻意重复实现，必须逐位相等。
+
+    aaa 层不得 import eval（分层约束），所以 formula 抄了一份。
+    这个测试就是防止两边悄悄漂移 —— 漂移了检测器就会用另一套公式，
+    而报告里还写着"同一个量"。"""
+    cam = _seq_camera(SC.natural_scene(W, H, backlit=True))
+    fr = cam.capture(ev=0.0, wb_gains=ideal_gains(5000.0))
+    a = structure_signal(fr.luma_linear)
+    b = IQ.texture_acutance(fr.luma_linear)
+    assert abs(a - b) < 1e-15, f"结构信号漂移了: {a} vs {b}"
+    # 亮度整体缩放不变（这是它能当"只看内容"的判别器的原因）。
+    # 注意要在 float64 里缩放：luma_linear 是 float32，直接 *100 会带进 ~1e-7
+    # 的相对误差，把这条性质测试变成"测浮点精度"而不是"测标度不变性"。
+    scaled = fr.luma_linear.astype(np.float64) * 100.0
+    assert abs(structure_signal(scaled) - a) < 1e-12, \
+        f"结构信号对亮度缩放不再不变: {a} vs {structure_signal(scaled)}"
+
+
+@case
+def test_jitter_floor_is_tiny():
+    """**把负结论固化成测试**：不注入扰动时，整帧测光的抖动等于浮点噪声。
+
+    480x360 下散粒噪声被空间平均掉，实测噪声地板约 1e-4 EV —— 比收敛阈值
+    低两个数量级。所以任何"时域滤波把抖动降低 90%"的说法在这个分辨率下
+    都是伪结论。这条测试就是防止以后有人（包括我自己）忘了这一点，
+    拿一个凭空冒出来的"显著改善"去写报告。"""
+    cam = _seq_camera(SC.natural_scene(W, H, backlit=True), seed=83)
+    r = _stream(cam, n=48)
+    h = r.history[24:]
+    met = [abs(hx["err_ev"]) for hx in h]
+    std = float(np.std(met))
+    assert std < 1e-3, f"无注入时的抖动应等于浮点噪声，实测 std={std:.3e} EV"
+
+
+@case
+def test_no_cut_on_ae_own_convergence():
+    """**最要命的一条假阳性**：AE 自己从 +3 EV 收敛，检测器必须零触发。
+
+    根因是过曝时像素饱和会同时破坏曝光归一化与标度不变性 —— 实测三个信号
+    全部超阈。护栏是"检测器只在 AE 连续稳定若干帧后才武装"，这条测试钉住它。"""
+    tcfg = TemporalConfig(cut_enable=True)
+    for ev0 in (3.0, 1.5):
+        cam = _seq_camera(SC.natural_scene(W, H, backlit=True), seed=67)
+        r = _stream(cam, tcfg=tcfg, n=40, ev0=ev0)
+        assert len(r.cut_frames) == 0, \
+            f"AE 自身收敛（ev0={ev0}）被误判成场景切换：帧 {r.cut_frames}"
+
+
+@case
+def test_scene_cut_detected_on_illumination_step():
+    """光照阶跃必须在 3 帧内被检出，且类型判为光照（不是内容）。"""
+    tcfg = TemporalConfig(cut_enable=True)
+    sc = SC.natural_scene(W, H, backlit=True)
+    cam = _seq_camera(sc, seed=67)
+    cut = 20
+
+    def on_frame(it):
+        if it == cut:
+            cam.set_scene(SC.dim(sc, 4.0))
+
+    r = _stream(cam, tcfg=tcfg, n=40, on_frame=on_frame)
+    assert r.cut_frames, "光照阶跃未被检出"
+    lat = min(r.cut_frames) - cut
+    assert 0 <= lat <= 3, f"检出延迟过大: {lat} 帧"
+    assert r.history[min(r.cut_frames)]["cut_kind"] == "illumination", \
+        "光照变化被判成了内容变化（分类用了 hist_dist 就会这样）"
+
+
+@case
+def test_executor_quantization_creates_limit_cycle():
+    """S3：执行器量化**不需要任何噪声**就能造出抖动 —— 抖动来自控制结构。
+
+    暗场景下曝光时间顶在上限、增益参与调节，所以增益档位量化起决定作用。
+    步长越大，极限环越大。这条测试证明"时域抖动"不是噪声的产物。"""
+    sc = SC.dim(SC.natural_scene(W, H, backlit=True), 1.0 / 40.0)
+    base = _stream(_seq_camera(sc, seed=83), n=60)
+    floor = float(np.std([h["err_ev"] for h in base.history[30:]]))
+    for step, factor in ((1.0 / 6.0, 50.0), (1.0 / 3.0, 80.0)):
+        scfg = SensorConfig(width=W, height=H, gain_step_ev=step)
+        cam = SimCamera(sc, 5000.0, scfg, ICFG, seed=83)
+        r = AEController(AEConfig()).run_stream(
+            lambda ev: cam.capture(ev=ev, wb_gains=ideal_gains(5000.0)), n_frames=60)
+        j = float(np.std([h["err_ev"] for h in r.history[30:]]))
+        ratio = j / max(floor, 1e-12)
+        assert ratio > factor, \
+            f"gain_step={step:.4f} 的极限环只有地板的 {ratio:.1f} 倍（期望 >{factor}）"
+
+
+@case
+def test_awb_stabilizer_reduces_flicker_without_bias():
+    """AWB 是开环估计器，时域滤波在这里是**干净的收益**：
+    增益跳动显著下降，而光源角度误差的**均值不能变差**（平滑不引入偏差）。"""
+    sc = SC.color_chart(W, H)
+    cam = _seq_camera(sc, seed=97)
+    ev = AEController(AEConfig()).run(
+        lambda e: cam.capture(ev=e, wb_gains=ideal_gains(5000.0)), ev0=-1.0).final_ev
+
+    def run(alpha):
+        c = _seq_camera(sc, seed=97)
+        st = AWBStabilizer(AWBConfig(),
+                           TemporalConfig(enable=True, alpha_slow=alpha) if alpha else None)
+        g, err = [], []
+        for _ in range(40):
+            fr = c.capture(ev=ev, wb_gains=ideal_gains(5000.0))
+            a = st.estimate(fr.linear_pre_wb, clipped_ratio=fr.clipped_ratio)
+            g.append(np.log2(np.clip(np.asarray(a.gains, float), 1e-9, None)))
+            err.append(illuminant_error_deg(a.illum_rgb, 5000.0))
+        g = np.asarray(g)[10:]
+        return float(np.mean(np.abs(np.diff(g, axis=0)))), float(np.mean(err[10:]))
+
+    f_raw, e_raw = run(None)
+    f_fil, e_fil = run(0.2)
+    assert f_fil < f_raw * 0.5, f"滤波没压住增益跳动: {f_raw:.5f} -> {f_fil:.5f}"
+    assert abs(e_fil - e_raw) < 0.2, \
+        f"滤波引入了偏差: 角度误差均值 {e_raw:.4f} -> {e_fil:.4f}"
+
+
+@case
+def test_temporal_filter_and_detector_disabled_are_noops():
+    """默认关闭时，滤波与检测器都必须是恒等变换（既有实验数值不受影响）。"""
+    f = EMAFilter(TemporalConfig(enable=False))
+    assert f.smooth(1.0) == 1.0
+    assert f.smooth(2.0) == 2.0
+
+    cam = _seq_camera(SC.natural_scene(W, H, backlit=True))
+    fr = cam.capture(ev=0.0, wb_gains=ideal_gains(5000.0))
+    d = SceneCutDetector(TemporalConfig(cut_enable=False))
+    for _ in range(5):
+        assert not d.update(fr, 0.5).cut
+
+    # AWB 稳定器在 temporal=None 时必须逐帧等价于原估计器
+    est = AWBEstimator(AWBConfig())
+    st = AWBStabilizer(AWBConfig(), None)
+    a = est.estimate(fr.linear_pre_wb)
+    b = st.estimate(fr.linear_pre_wb)
+    assert np.allclose(a.gains, b.gains, atol=1e-12)
+
+
+@case
+def test_settle_frames_and_ringing_helpers():
+    """评价口径本身也要有测试：未收敛必须如实返回 -1，不能拿"最后一帧达标"糊弄。"""
+    assert MT.settle_frames([1.0, 1.0, 0.01, 0.01, 0.01], 0.05, hold=3) == 5
+    assert MT.settle_frames([0.01, 0.01, 1.0], 0.05, hold=3) == -1
+    # alpha 小 + 阻尼大 -> 共轭复极点，会振铃；alpha=1 是实极点，不振铃
+    p = MT.pole_ringing_period(0.7, 0.2)
+    assert np.isfinite(p) and p > 1.0, f"复极点应给出有限振铃周期，得到 {p}"
+    assert not np.isfinite(MT.pole_ringing_period(0.7, 1.0)), "alpha=1 不应振铃"
+
+
+@case
+def test_executor_split_exposure_still_exact_when_quantization_off():
+    """量化默认关闭时，split_exposure 必须与之前逐位一致（保护既有结论）。"""
+    for ev in (-3.0, 0.0, 2.0):
+        et, g = split_exposure(ev, SCFG)
+        et2, g2 = split_exposure(ev, SensorConfig(width=W, height=H))
+        assert et == et2 and g == g2
+    et, g = split_exposure(0.0, SCFG)
+    assert abs(et - 1.0 / 60.0) < 1e-12 and abs(g - 1.0) < 1e-12
 
 
 def run_all():

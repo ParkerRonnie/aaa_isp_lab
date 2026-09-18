@@ -4,8 +4,9 @@
 
 ```bash
 pip install -e ".[dev]"     # 可编辑安装 + 测试/检查工具
-pytest                       # 跑单元测试（21 个）
-aaa-isp-lab --fast           # 端到端跑一遍，约 15s
+pytest                       # 跑单元测试（38 个）
+aaa-isp-lab --fast           # 端到端跑一遍，约 45s
+aaa-isp-lab                  # 全量，约 4 分钟（时域那几个实验是逐帧序列，占大头）
 ```
 
 不安装也能跑（源码目录直接执行）：

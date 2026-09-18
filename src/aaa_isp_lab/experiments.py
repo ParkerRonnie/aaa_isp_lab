@@ -16,7 +16,7 @@ from .sim import scene as SC
 from .sim.camera import SimCamera, ev_limits, flicker_banding_metric
 from .sim.sensor import SensorSim
 from .aaa.ae import AEController
-from .aaa.awb import AWBEstimator, ideal_gains, illuminant_error_deg
+from .aaa.awb import AWBEstimator, AWBStabilizer, ideal_gains, illuminant_error_deg
 from .color_science import rgb_to_cct_duv
 from .aaa import af as AF
 from .isp import modules as IM
@@ -614,3 +614,459 @@ def exp_image_quality(scfg, icfg, size, af_cfg):
     out["shading"] = {"rows": rows}
 
     return out
+
+
+# -----------------------------------------------------------------------------
+# 12. 时域抖动源：先把噪声地板测出来
+# -----------------------------------------------------------------------------
+def _stream_jitter(scene, temp, scfg, icfg, ae_cfg, temporal_cfg, seed, n_frames,
+                   ev0=0.0, cam_setup=None):
+    """跑一条**静止**序列，返回稳态窗内的三级抖动统计。
+
+    窗口取后半段 [n/2, n)：前半段是收敛瞬态，把瞬态算进抖动是最常见的
+    自欺欺人（会得到一个跟滤波强度无关的假大数）。
+    """
+    cam = make_camera(scene, temp, scfg, icfg, seed=seed)
+    if cam_setup is not None:
+        cam_setup(cam)
+    ctl = AEController(copy.deepcopy(ae_cfg), temporal_cfg)
+    r = ctl.run_stream(lambda ev: cam.capture(ev=ev, wb_gains=ideal_gains(temp)),
+                       ev0=ev0, n_frames=n_frames)
+    h = r.history[n_frames // 2:]
+    ev_cmd = [x["ev"] for x in h]
+    ev_ach = [x["ev_ach"] for x in h]
+    met = [float(np.log2(max(x["metric"], 1e-9) / max(x["target"], 1e-9))) for x in h]
+    st = MT.jitter_stats(ev_cmd, ev_ach, met)
+    st["gain_mean"] = float(np.mean([x["gain"] for x in h]))
+    st["et_ms_mean"] = float(np.mean([x["exposure_s"] for x in h])) * 1000.0
+    st["ev_hist"] = [x["ev"] for x in r.history]
+    st["ach_hist"] = [x["ev_ach"] for x in r.history]
+    return st
+
+
+def _setup_flicker(cam):
+    cam.flicker_amplitude = 0.25
+    cam.flicker_phase_jitter = 0.35
+
+
+def exp_temporal_jitter_source(scfg, icfg, size, ae_cfg, temporal_cfg, n_frames=60):
+    """12. 抖动从哪来 —— 必须先做，它决定后面所有结论是否有意义。
+
+    整帧测光把光子散粒噪声平均掉了：480x360 下折算约 1e-4 EV，
+    比收敛阈值 0.02 EV 低两个数量级。**所以静止场景的 AE 抖动恒等于浮点噪声**，
+    "时域滤波把抖动降低 90%" 在这个分辨率下必然是伪结论。
+
+    要让时域滤波有意义，扰动必须作为**显式的物理源**注入：
+
+      S1 光源强度波动   LED 驱动纹波 / 市电电压波动，加在光学之前（乘性）
+      S2 闪烁相位漂移   帧时序未锁相于市电，纹波相对读出起点的相位逐帧变
+      S3 执行器量化     曝光时间寄存器步进 / 增益档位 —— **确定性，不需要噪声**
+
+    S3 是关键：它说明抖动是**控制结构的产物**，不是噪声的产物。
+    而且是分域的：亮场景（EV<0）增益钳在 1.0，抖动由曝光时间量化主导；
+    暗场景（EV>0）曝光时间顶在上限，抖动由增益档位主导。
+
+    floor_ratio 必须**逐条件**算：地板随曝光下降而涨，且强依赖测光方式
+    （实测 evaluative 4e-5 vs spot 2.6e-3）。用一个全局地板去除所有源会误判。
+    """
+    bright = SC.natural_scene(*size, backlit=True)
+    dim = SC.dim(bright, 1.0 / 40.0)
+
+    specs = [
+        ("S0 无注入（噪声地板）", "S0", {}, None),
+        ("S1 光源波动 0.5%", "S1", {}, lambda c: setattr(c, "illum_ripple_frac", 0.005)),
+        ("S1 光源波动 2%", "S1", {}, lambda c: setattr(c, "illum_ripple_frac", 0.02)),
+        ("S2 闪烁相位抖动", "S2", {}, _setup_flicker),
+        ("S3 增益量化 1/6 EV", "S3", {"gain_step_ev": 1.0 / 6.0}, None),
+        ("S3 增益量化 1/3 EV", "S3", {"gain_step_ev": 1.0 / 3.0}, None),
+        ("S3 曝光时间量化 10us", "S3", {"et_step_s": 1e-5}, None),
+        ("S4 量化 + 光源波动", "S4", {"gain_step_ev": 1.0 / 6.0},
+         lambda c: setattr(c, "illum_ripple_frac", 0.005)),
+    ]
+
+    rows = []
+    for regime, scene in (("亮场景", bright), ("暗场景 (1/40)", dim)):
+        floor = None
+        for label, source, overrides, setup in specs:
+            s = copy.deepcopy(scfg)
+            for k, v in overrides.items():
+                setattr(s, k, v)
+            st = _stream_jitter(scene, 5000.0, s, icfg, ae_cfg, temporal_cfg,
+                                seed=83, n_frames=n_frames, cam_setup=setup)
+            j = st["metric"]["std"]
+            if floor is None:
+                floor = j
+            rows.append({
+                "regime": regime, "label": label, "source": source,
+                "jitter_metric_std": j,
+                "jitter_metric_p2p": st["metric"]["p2p"],
+                "jitter_ev_cmd_std": st["ev_cmd"]["std"],
+                "jitter_ev_ach_std": st["ev_ach"]["std"],
+                "gain_mean": st["gain_mean"], "et_ms_mean": st["et_ms_mean"],
+                "floor": floor,
+                "floor_ratio": (j / floor) if floor > 1e-12 else 0.0,
+                "ev_hist": st["ev_hist"], "ach_hist": st["ach_hist"],
+            })
+
+    # 显著性的门槛：相对地板 20 倍才认为"这个源值得滤波"（低于它就该如实写"不显著"）
+    sig = [r for r in rows if r["source"] != "S0" and r["floor_ratio"] >= 20.0]
+    return {"rows": rows, "window": [n_frames // 2, n_frames],
+            "n_frames": int(n_frames), "seeds": [83],
+            "significant_ratio": 20.0, "n_significant": len(sig)}
+
+
+# -----------------------------------------------------------------------------
+# 13. AE 时域滤波：抖动 vs 响应速度的权衡
+# -----------------------------------------------------------------------------
+def exp_ae_temporal(scfg, icfg, size, ae_cfg, temporal_cfg, n_frames=72):
+    """13. 时域滤波 vs 场景切换检测：抖动与延迟分别由谁决定。
+
+    一条序列同时产出两个指标，省一半成像：
+      前半段（切换前）静止 -> 稳态**曝光抖动**（AE 有没有追着扰动跑）
+      在第 cut 帧做内容切换 -> 切换后重收敛帧数
+    `cut` 帧（真值）由参数直接给，检测器只负责把它**认出来**，两条线可以分开评估。
+
+    抖动源用 S1 光源波动（实验 12 实测 30x 地板、且严格线性），
+    它是真实场景里"一直存在"的那种扰动。
+
+    **实测结论与最初的设想相反，这里如实按数据写：**
+
+    1) 时域滤波并没有降低曝光抖动。最好的自适应档只比无滤波好 23%，
+       而固定强滤波（alpha<=0.2）**反而失稳**（曝光抖动 0.18 / 1.75 EV）——
+       因为控制律是变步长的（d 最大 0.9，过曝补偿还能推到 1.0），慢滤波叠加
+       这个大增益把闭环推向振荡。所以"把滤波开大一点"不是免费午餐。
+    2) **场景切换检测器才是真正有价值的那一半**：固定 alpha=0.4 时把重收敛
+       从 17 帧砍到 6 帧，而抖动分毫不变。它买到的是"切换时立刻松手"，
+       不牺牲稳态平滑。
+    3) 自适应 alpha 规则下检测器是**冗余的**（大误差本来就触发 fast），
+       如实记录，不硬凑它有用。
+
+    同时把二阶极点的**解析振铃周期**写进数据供对照；对不上就写
+    "线性化在高频段失效"，不改实测数据去迁就公式。
+    """
+    bright = SC.natural_scene(*size, backlit=True)
+    chart = SC.color_chart(*size)
+    # 先让 AE 稳定，再做内容切换；这个帧号同时作为重收敛的真值起点
+    cut = n_frames // 2
+    ripple = 0.005          # 0.5% 光源波动（实验 12 实测 30x 地板，显著）
+
+    def _run(label, alpha_fast, alpha_slow, adaptive, cut_enable):
+        tc = copy.deepcopy(temporal_cfg)
+        tc.enable = alpha_slow < 1.0
+        tc.adaptive = adaptive
+        tc.alpha_fast = alpha_fast
+        tc.alpha_slow = alpha_slow
+        tc.cut_enable = cut_enable
+        cam = make_camera(bright, 5000.0, scfg, icfg, seed=89)
+        cam.illum_ripple_frac = ripple
+
+        def on_frame(it):
+            if it == cut:
+                cam.set_scene(chart)
+
+        ctl = AEController(copy.deepcopy(ae_cfg), tc)
+        r = ctl.run_stream(
+            lambda ev: cam.capture(ev=ev, wb_gains=ideal_gains(5000.0)),
+            ev0=0.0, n_frames=n_frames, on_frame=on_frame, cut_frame=cut)
+
+        h = r.history
+        # 稳态抖动：切换**前**的后半段（前 1/4 是收敛瞬态，不能算）
+        w0, w1 = n_frames // 4, cut
+        steady = h[w0:w1]
+        st = MT.jitter_stats(
+            [x["ev"] for x in steady],
+            [x["ev_ach"] for x in steady],
+            [float(np.log2(max(x["metric"], 1e-9) / max(x["target"], 1e-9)))
+             for x in steady])
+        # 切换后的过冲与方向反转（振铃的直接证据）
+        post = h[cut:]
+        ev_post = [x["ev"] for x in post]
+        tgt = float(np.mean([x["ev"] for x in h[w1 - 5:w1]])) if w1 > w0 else 0.0
+        overshoot = max((abs(e - tgt) for e in ev_post), default=0.0)
+        rev = 0
+        for i in range(2, len(ev_post)):
+            a = ev_post[i - 1] - ev_post[i - 2]
+            b = ev_post[i] - ev_post[i - 1]
+            if a * b < 0:
+                rev += 1
+
+        return {
+            "label": label,
+            "alpha_slow": float(alpha_slow),
+            "alpha_fast": float(alpha_fast),
+            "adaptive": bool(adaptive),
+            "detector": bool(cut_enable),
+            "jitter_metric_std": st["metric"]["std"],
+            "jitter_metric_p2p": st["metric"]["p2p"],
+            "jitter_ev_cmd_std": st["ev_cmd"]["std"],
+            "jitter_ev_ach_std": st["ev_ach"]["std"],
+            "settle_frames": int(r.settle_frames),
+            "overshoot_ev": float(overshoot),
+            "reversals_post": int(rev),
+            "n_cut_detected": len(r.cut_frames),
+            "cut_frames": list(r.cut_frames),
+            "ev_hist": [x["ev"] for x in h],
+            "err_hist": [abs(x["err_ev"]) for x in h],
+        }
+
+    # 关键对照是**成对**的：同一个稳态滤波强度下检测器开/关。
+    # 只有成对比较才能把"检测器的贡献"从"滤波强度的贡献"里分离出来。
+    #
+    # 坑（曾经静默失效过一次）：检测器触发时滤波器切到的是 **alpha_fast**，
+    # 所以 alpha_fast 必须真的比稳态用的 alpha_slow 更快，否则"检测器开了"
+    # 和"检测器关了"数值完全一样，看起来一切正常但结论是假的。
+    # 前两列就是 (alpha_fast, alpha_slow)。
+    configs = [
+        ("无滤波 (alpha=1)", 1.0, 1.0, False, False),
+        ("固定 alpha=0.5（检测器关）", 0.9, 0.5, False, False),
+        ("固定 alpha=0.5 + 检测器", 0.9, 0.5, False, True),
+        ("固定 alpha=0.4（检测器关）", 0.9, 0.4, False, False),
+        ("固定 alpha=0.4 + 检测器", 0.9, 0.4, False, True),
+        ("固定 alpha=0.2（检测器关）", 0.9, 0.2, False, False),
+        ("固定 alpha=0.1（检测器关）", 0.9, 0.1, False, False),
+        ("自适应 alpha（检测器关）", 0.9, 0.2, True, False),
+        ("自适应 alpha + 检测器", 0.9, 0.2, True, True),
+    ]
+    rows = [_run(*c) for c in configs]
+
+    # 帕累托最优：在 (曝光抖动, 重收敛帧数) 平面上没有被别人同时压过的点。
+    #
+    # 轴选**曝光抖动**而不是画面抖动：画面抖动对 i.i.d. 的光源波动本来就不可约
+    # （AE 慢一帧，压不掉当前帧的亮度误差），滤波真正能改的是"AE 移动了多少" ——
+    # 也就是会不会出现肉眼可见的亮度抽动。
+    #
+    # settle_frames = -1 表示**未收敛**，是最差，不是最好 —— 曾经把它当小值
+    # 处理，结果"失稳的那一行"被判成了 Pareto 最优。
+    def _settle(r):
+        return float("inf") if r["settle_frames"] < 0 else float(r["settle_frames"])
+
+    def dominated(row, others):
+        for o in others:
+            if o is row:
+                continue
+            better_or_eq = (o["jitter_ev_cmd_std"] <= row["jitter_ev_cmd_std"] * 1.05
+                            and _settle(o) <= _settle(row) * 1.05)
+            strictly = (o["jitter_ev_cmd_std"] < row["jitter_ev_cmd_std"] * 0.95
+                        or _settle(o) < _settle(row) * 0.95)
+            if better_or_eq and strictly:
+                return True
+        return False
+
+    for r in rows:
+        r["pareto_optimal"] = not dominated(r, rows)
+
+    return {"rows": rows, "cut_frame": int(cut), "window": [n_frames // 4, cut],
+            "n_frames": int(n_frames), "ripple": ripple,
+            "ringing_period_analytic": MT.pole_ringing_period(ae_cfg.damping, 0.2)}
+
+
+# -----------------------------------------------------------------------------
+# 14. 场景切换检测：门限标定、误触发率与分离度
+# -----------------------------------------------------------------------------
+def _cut_probe(scene, temp, scfg, icfg, ae_cfg, temporal_cfg, seed, n_frames,
+               ev0=0.0, switch=None, cut=None, ripple=0.0):
+    """跑一条序列，返回检测器在**已武装**帧上的信号与检出情况。"""
+    tc = copy.deepcopy(temporal_cfg)
+    tc.enable = False           # 只测检测器，不叠加滤波，避免两个变量纠缠
+    tc.cut_enable = True
+    cam = make_camera(scene, temp, scfg, icfg, seed=seed)
+    cam.illum_ripple_frac = ripple
+
+    def on_frame(it):
+        if switch is not None and it == cut:
+            switch(cam)
+
+    ctl = AEController(copy.deepcopy(ae_cfg), tc)
+    r = ctl.run_stream(lambda ev: cam.capture(ev=ev, wb_gains=ideal_gains(temp)),
+                       ev0=ev0, n_frames=n_frames, on_frame=on_frame)
+    armed = [h for h in r.history if h.get("armed")]
+    return r, armed
+
+
+def exp_scene_cut(scfg, icfg, size, ae_cfg, temporal_cfg, seeds=(67, 73), n_frames=36):
+    """14. 场景切换检测 —— 门限由数据定，并给出误触发率与分离度。
+
+    这一节要回答三个问题，每个都必须有数字：
+
+    1) **误触发率**。最要命的假阳性是"AE 自己还在收敛"，因为过曝时像素饱和
+       会同时破坏曝光归一化和结构信号的标度不变性。所以静止条件里必须包含
+       "从 +3 EV 起步让 AE 收敛"这一条，且要求它零触发。
+    2) **分离度**。静止时信号的最坏值 vs 真实切换时的最小信号，中间隔了多少倍。
+       计划判据：门限 < 0.5 x 切换最小值。
+    3) **等亮度色温切换检测不到**（实测 5000K->3000K 等亮度时三个信号全部低于
+       门限）。这是这套检测器的**边界**：它测的是亮度与内容变化，不是色度变化。
+       如实写出来，不藏。
+
+    检测器只在 AE 连续稳定 `settle_hold` 帧之后才武装（见 temporal.SceneCutDetector），
+    所以静止条件里包含 AE 收敛过程，正好检验这条护栏。
+    """
+    bright = SC.natural_scene(*size, backlit=True)
+    chart = SC.color_chart(*size)
+    uni = SC.uniform_scene(*size)
+    dim = SC.dim(bright, 1.0 / 40.0)
+    cut = n_frames // 2
+
+    # --- 静止条件：任何一条触发都算误报 ---
+    static_conds = [
+        ("natural 亮光", bright, 0.0, 0.0),
+        ("natural 暗光(1/40)", dim, 0.0, 0.0),
+        ("natural 光源波动 0.5%", bright, 0.0, 0.005),
+        ("uniform 亮光", uni, 0.0, 0.0),
+        # 最重要的一条：AE 自身收敛（+3EV 起步，重度过曝）
+        ("AE 自身收敛 (+3EV 起步)", bright, 3.0, 0.0),
+    ]
+    static = []
+    for label, scene, ev0, rip in static_conds:
+        for seed in seeds:
+            r, armed = _cut_probe(scene, 5000.0, scfg, icfg, ae_cfg, temporal_cfg,
+                                  seed, n_frames, ev0=ev0, ripple=rip)
+            mx = {"d_metric_ev": 0.0, "texture_ratio": 0.0, "hist_dist": 0.0}
+            for h in armed:
+                for k in mx:
+                    mx[k] = max(mx[k], float(h["cut_parts"].get(k, 0.0)))
+            static.append({"cond": label, "seed": seed,
+                           "n_armed": len(armed), "fired": len(r.cut_frames),
+                           **{f"max_{k}": v for k, v in mx.items()}})
+
+    # --- 真实切换事件（truth_kind 是分类的真值，用来实测分类准确率）---
+    events = [
+        ("内容切换 natural→colorchart", "content", bright, lambda c: c.set_scene(chart)),
+        ("光照 ×4", "illumination", bright, lambda c: c.set_scene(SC.dim(bright, 4.0))),
+        ("光照 ×1/4", "illumination", bright, lambda c: c.set_scene(SC.dim(bright, 0.25))),
+        ("色温 5000K→3000K（等亮度）", "illumination",
+         bright, lambda c: c.set_scene(bright, 3000.0)),
+    ]
+    cuts = []
+    for label, truth, scene, fn in events:
+        for seed in seeds:
+            r, _ = _cut_probe(scene, 5000.0, scfg, icfg, ae_cfg, temporal_cfg,
+                              seed, n_frames, switch=fn, cut=cut)
+            h = r.history[cut]
+            lat = (min(r.cut_frames) - cut) if r.cut_frames else -1
+            # 分类结果取**首个检出帧**的 kind（没检出就是 none）
+            est = r.history[min(r.cut_frames)]["cut_kind"] if r.cut_frames else "none"
+            cuts.append({"event": label, "seed": seed, "truth_kind": truth,
+                         "est_kind": est,
+                         "latency": lat, "detected": bool(r.cut_frames),
+                         **{k: float(h["cut_parts"].get(k, 0.0))
+                            for k in ("d_metric_ev", "texture_ratio", "hist_dist")}})
+
+    # --- 汇总：分离度与两个比率 ---
+    sig_names = ("d_metric_ev", "texture_ratio", "hist_dist")
+    thresh = {"d_metric_ev": temporal_cfg.cut_metric_ev,
+              "texture_ratio": temporal_cfg.cut_texture_ratio,
+              "hist_dist": temporal_cfg.cut_hist_dist}
+    static_max = {k: max(r[f"max_{k}"] for r in static) for k in sig_names}
+    # 等亮度色温切换检测不到是已知边界，算分离度时排除，单独列出
+    det_cuts = [c for c in cuts if "色温" not in c["event"]]
+    cut_min = {k: min(c[k] for c in det_cuts) for k in sig_names}
+
+    n_static_runs = len(static)
+    n_fired = sum(1 for r in static if r["fired"])
+    n_det = sum(1 for c in cuts if c["detected"])
+    cct_events = [c for c in cuts if "色温" in c["event"]]
+
+    return {
+        "static": static, "cuts": cuts,
+        "thresholds": thresh, "static_max": static_max, "cut_min": cut_min,
+        "separation": {k: (cut_min[k] / static_max[k]) if static_max[k] > 1e-12 else float("inf")
+                       for k in sig_names},
+        "margin_vs_thresh": {k: (cut_min[k] / thresh[k]) if thresh[k] > 1e-12 else float("inf")
+                             for k in sig_names},
+        "false_trigger_rate": (n_fired / n_static_runs) if n_static_runs else 0.0,
+        "n_static_runs": n_static_runs, "n_static_fired": n_fired,
+        "detect_rate": (n_det / len(cuts)) if cuts else 0.0,
+        "n_cut_runs": len(cuts), "n_detected": n_det,
+        "cct_equal_luma_detected": sum(1 for c in cct_events if c["detected"]),
+        "cct_equal_luma_total": len(cct_events),
+        # 分类准确率：分母只算**检出来了的**事件（没检出来的谈不上分对分错）
+        "kind_correct": sum(1 for c in cuts if c["detected"] and c["est_kind"] == c["truth_kind"]),
+        "kind_total": n_det,
+        "kind_accuracy": (sum(1 for c in cuts if c["detected"]
+                              and c["est_kind"] == c["truth_kind"]) / n_det) if n_det else 0.0,
+        "cut_frame": int(cut), "n_frames": int(n_frames), "seeds": list(seeds),
+    }
+
+
+# -----------------------------------------------------------------------------
+# 15. AWB 时域稳定：不引入偏差，且能压住颜色呼吸
+# -----------------------------------------------------------------------------
+def exp_awb_temporal(scfg, icfg, size, awb_cfg, temporal_cfg,
+                     n_frames=60, temp_a=5000.0, temp_b=3000.0):
+    """15. AWB 的对数域时域稳定。
+
+    序列：前半段 5000K，第 cut 帧切到 3000K（同场景，只换光源）。
+    曝光固定在**第一个光源下 AE 收敛到的 EV**，全程不变 —— 这样比的是
+    AWB 本身的时域行为，不掺 AE 的动作。
+
+    三个指标，缺一不可：
+      gain_flicker   稳态窗内 mean|d log2(gain)| —— "颜色呼吸"的量化
+      angle_err_*    光源角度误差的均值/标准差。**滤波不能让它变差** ——
+                     平滑如果不引入偏差，均值应该基本不变；这是"平滑无害"的正面证据
+      settle_frames  切光源后重新回到误差阈内所需帧数
+
+    与 AE 侧不同，AWB 在这里**确实**有可压的抖动：估计器逐帧独立，
+    没有任何记忆，画面噪声直接体现为增益的逐帧跳动。
+    """
+    sc = SC.color_chart(*size)
+    cut = n_frames // 2
+    thr = 3.0           # 稳定判据：光源角度误差回到 3 度以内
+
+    # 固定曝光：取第一个光源下 AE 收敛到的 EV，全程不变
+    ae_tmp = AEConfig()
+    ae_tmp.ev_min, ae_tmp.ev_max = ev_limits(scfg)
+    cam0 = make_camera(sc, temp_a, scfg, icfg, seed=97)
+    ev_fix = AEController(ae_tmp).run(
+        lambda ev: cam0.capture(ev=ev, wb_gains=ideal_gains(temp_a)), ev0=-1.0).final_ev
+
+    configs = [
+        ("无时域滤波", None, False),
+        ("alpha=0.9", 0.9, True),
+        ("alpha=0.5", 0.5, True),
+        ("alpha=0.2", 0.2, True),
+    ]
+    rows = []
+    for label, alpha, enable in configs:
+        tcfg = copy.deepcopy(temporal_cfg)
+        tcfg.enable = enable
+        if alpha is not None:
+            tcfg.alpha_slow = alpha
+        cam = make_camera(sc, temp_a, scfg, icfg, seed=97)
+        stab = AWBStabilizer(copy.deepcopy(awb_cfg), tcfg if enable else None)
+        g_hist, err_hist = [], []
+        for i in range(n_frames):
+            if i == cut:
+                cam.set_scene(sc, temp_b)
+            fr = cam.capture(ev=ev_fix, wb_gains=ideal_gains(temp_a))
+            a = stab.estimate(fr.linear_pre_wb, clipped_ratio=fr.clipped_ratio)
+            g_hist.append(np.log2(np.clip(np.asarray(a.gains, dtype=np.float64), 1e-9, None)))
+            err_hist.append(illuminant_error_deg(a.illum_rgb, temp_a if i < cut else temp_b))
+        g = np.asarray(g_hist)
+        e = np.asarray(err_hist)
+        steady = slice(n_frames // 4, cut)
+        flicker = float(np.mean(np.abs(np.diff(g[steady], axis=0)))) if cut > n_frames // 4 else 0.0
+        # 切光源后的重收敛（连续 3 帧回到阈值内）
+        settle, run = -1, 0
+        for i in range(cut, n_frames):
+            run = run + 1 if e[i] < thr else 0
+            if run >= 3:
+                settle = i - cut + 1
+                break
+        post = slice(cut + settle if settle > 0 else cut, n_frames)
+        rows.append({
+            "label": label, "alpha": alpha, "enable": bool(enable),
+            "gain_flicker": flicker,
+            "angle_err_mean": float(e[steady].mean()),
+            "angle_err_std": float(e[steady].std()),
+            "angle_err_post_mean": float(e[post].mean()) if e[post].size else float("nan"),
+            "settle_frames": settle,
+            "err_hist": [float(x) for x in e],
+            "n_reset": int(stab.n_reset), "n_hold": int(stab.n_hold),
+        })
+
+    base = rows[0]
+    return {"rows": rows, "cut_frame": int(cut), "n_frames": int(n_frames),
+            "ev_fix": float(ev_fix), "temp_a": temp_a, "temp_b": temp_b,
+            "settle_thresh_deg": thr, "steady_window": [n_frames // 4, cut],
+            # 无滤波基线的稳态误差，报告里用来对照"滤波有没有引入偏差"
+            "baseline_angle_err_mean": base["angle_err_mean"]}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aaa-isp-lab"
-version = "0.1.0"
+version = "0.2.0"
 description = "3A（AE/AWB/AF）算法与 ISP 画质调优实验平台：从物理建模到量化评价的完整仿真链路"
 readme = "README.md"
 requires-python = ">=3.9"

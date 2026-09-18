@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import cv2
 
-from ..config import AWBConfig
+from ..config import AWBConfig, TemporalConfig
 from ..color_science import (blackbody_linear_rgb, rgb_linear_to_xyz, xy_to_cct,
                              cct_to_xy, illuminant_angle_deg)
 
@@ -243,3 +243,93 @@ def ideal_gains(true_temp_k: float) -> np.ndarray:
 
 def illuminant_error_deg(est_illum: np.ndarray, true_temp_k: float) -> float:
     return illuminant_angle_deg(est_illum, blackbody_linear_rgb(true_temp_k))
+
+
+def _angle_between(a: np.ndarray, b: np.ndarray) -> float:
+    """两个 RGB 光源向量之间的夹角（度）。完全相同 = 0。"""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na < 1e-12 or nb < 1e-12:
+        return 0.0
+    c = float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
+    return float(np.degrees(np.arccos(c)))
+
+
+class AWBStabilizer:
+    """AWB 的时域稳定器：对光源估计做**对数域**滤波。
+
+    用组合而**不修改** `AWBEstimator.estimate`：那是纯逐帧函数、调用点多
+    （experiments / tests 都在用），改签名会波及一片。稳定器只包一层，
+    原来的逐帧契约不变。
+
+    为什么在对数域：光源是乘性量，沿用融合那一步的做法
+    （awb.py 里 illum 用的就是对数域加权几何平均）。线性域算术平均会被
+    亮通道带偏。
+
+    两个安全阀，都是必要的：
+      - 估计器走兜底分支（有效像素不足）时**保持上一帧**，不跟坏帧走。
+        欠曝时几乎必然触发 —— 项目里已有结论"欠曝到 -3EV 以下 AWB 完全失效"。
+      - 光源估计相对当前状态的变化超过 `cut_angle_deg` 时**重置**而不是抹平：
+        那是真的换光源了，抹平只会让颜色慢慢爬过去，反而不如不动。
+
+    状态在实例上（`_log_state`），不在 cfg 上 —— 同 AE 侧的理由。
+    """
+
+    def __init__(self, cfg: AWBConfig = None, temporal: TemporalConfig = None):
+        self.cfg = cfg or AWBConfig()
+        self.temporal_cfg = temporal
+        self.est = AWBEstimator(self.cfg)
+        self.reset()
+
+    def reset(self) -> None:
+        self._log_state = None
+        self._n_reset = 0
+        self._n_hold = 0
+
+    @property
+    def n_reset(self) -> int:
+        """重置次数（= 判定换了光源的次数），供报告与测试读取。"""
+        return self._n_reset
+
+    @property
+    def n_hold(self) -> int:
+        """保持上一帧的次数（估计器兜底），供报告与测试读取。"""
+        return self._n_hold
+
+    def _rebuild(self, base: AWBResult) -> AWBResult:
+        illum = np.exp(self._log_state)
+        illum = illum / illum[1]
+        gains = 1.0 / illum
+        gains = gains / gains[1]
+        return AWBResult(illum_rgb=illum.astype(np.float32),
+                         gains=gains.astype(np.float32),
+                         method=base.method + "+temporal", cct=base.cct,
+                         weights=base.weights, detail=dict(base.detail))
+
+    def estimate(self, linear_pre_wb: np.ndarray, clipped_ratio: float = 0.0) -> AWBResult:
+        r = self.est.estimate(linear_pre_wb, clipped_ratio)
+        t = self.temporal_cfg
+        if t is None or not t.enable:
+            return r
+
+        v = np.log(np.clip(r.illum_rgb / max(float(r.illum_rgb[1]), 1e-9), 1e-6, None))
+
+        if self._log_state is None:
+            self._log_state = v
+            return r
+
+        # 兜底帧：估计器没能给出可信光源（有效像素不足），保持上一帧
+        if int(r.detail.get("n_valid", 1)) <= 0:
+            self._n_hold += 1
+            return self._rebuild(r)
+
+        # 光源真的换了就重置，不要抹平
+        if _angle_between(np.exp(v), np.exp(self._log_state)) > float(t.cut_angle_deg):
+            self._log_state = v
+            self._n_reset += 1
+            return r
+
+        a = float(t.alpha_slow)
+        self._log_state = a * v + (1.0 - a) * self._log_state
+        return self._rebuild(r)

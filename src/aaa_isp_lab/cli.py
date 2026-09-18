@@ -18,7 +18,8 @@ import time
 
 import numpy as np
 
-from .config import SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig
+from .config import (SensorConfig, ISPConfig, AEConfig, AWBConfig, AFConfig,
+                     TemporalConfig)
 from .sim.camera import ev_limits
 from .eval import report as RP
 from . import experiments as EX
@@ -43,8 +44,17 @@ def run(argv=None) -> dict:
     ae_cfg = AEConfig()
     awb_cfg = AWBConfig()
     af_cfg = AFConfig()
+    tcfg = TemporalConfig()
     lo, hi = ev_limits(scfg)
     ae_cfg.ev_min, ae_cfg.ev_max = lo, hi
+
+    # 时域实验的规模随 --fast 缩水。这几个实验是**逐帧序列**，帧数直接决定
+    # 成像次数（每个新实验几百次），不缩水会让 CI 时间翻倍。
+    t13 = 24 if args.fast else 48     # 抖动源
+    t14 = 40 if args.fast else 72     # 滤波/检测器权衡
+    t15 = 24 if args.fast else 36     # 场景切换检测
+    t16 = 36 if args.fast else 60     # AWB 稳定
+    t_seeds = (67,) if args.fast else (67, 73)
 
     t0 = time.time()
     print(f"仿真分辨率 {size[0]}×{size[1]}，EV 可用范围 [{lo:+.2f}, {hi:+.2f}]")
@@ -61,6 +71,14 @@ def run(argv=None) -> dict:
         ("AF 搜索策略", lambda: EX.exp_af_search(scfg, icfg, af_cfg, size)),
         ("3A 耦合", lambda: EX.exp_coupling(scfg, icfg, ae_cfg, awb_cfg, af_cfg, size)),
         ("画质指标", lambda: EX.exp_image_quality(scfg, icfg, size, af_cfg)),
+        ("时域抖动源", lambda: EX.exp_temporal_jitter_source(
+            scfg, icfg, size, ae_cfg, tcfg, n_frames=t13)),
+        ("AE 时域滤波", lambda: EX.exp_ae_temporal(
+            scfg, icfg, size, ae_cfg, tcfg, n_frames=t14)),
+        ("场景切换检测", lambda: EX.exp_scene_cut(
+            scfg, icfg, size, ae_cfg, tcfg, seeds=t_seeds, n_frames=t15)),
+        ("AWB 时域稳定", lambda: EX.exp_awb_temporal(
+            scfg, icfg, size, awb_cfg, tcfg, n_frames=t16)),
     ]
     R = {}
     for name, fn in steps:
@@ -86,7 +104,15 @@ def run(argv=None) -> dict:
         "af_search": R["AF 搜索策略"],
         "coupling": R["3A 耦合"],
         "image_quality": R["画质指标"],
+        "temporal_source": R["时域抖动源"],
+        "temporal_ae": R["AE 时域滤波"],
+        "scene_cut": R["场景切换检测"],
+        "temporal_awb": R["AWB 时域稳定"],
     }
+    # n_captures 必须**在全部实验跑完之后**再读：上面 res 字典里的 exp_isp 和
+    # exp_ae_flicker 是内联调用的，执行顺序在 meta 之后 —— 原先在字典字面量里读
+    # 会漏掉这两个实验的成像次数（实测少算 13 次），报告里的数字和实际不符。
+    res["meta"]["n_captures"] = EX.N_CAPTURES[0]
 
     print("生成报告 ...")
     paths = RP.build_report(res, outdir)

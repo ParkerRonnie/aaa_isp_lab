@@ -44,6 +44,14 @@ class SensorConfig:
         (0.07, 0.88, 0.05),
         (0.02, 0.12, 0.86),
     )
+    # --- 执行器量化（时域抖动的**确定性**来源）---
+    # 曝光时间寄存器有最小步进、模拟增益按档位走（真实相机常见 1/6 EV），
+    # 所以控制器**请求**的 EV 与相机**实际达成**的 EV 不相等。闭环会在量化
+    # 台阶之间来回跳，形成极限环。
+    # 这是真实 AE 必须做时域平滑的头号原因，而且它不需要任何噪声：
+    # 抖动来自控制结构本身。默认 0 = 无限细分（等于关闭量化）。
+    et_step_s: float = 0.0                    # 曝光时间寄存器步进 (s)
+    gain_step_ev: float = 0.0                 # 增益档位步进 (EV)
 
     @property
     def max_dn(self) -> float:
@@ -152,6 +160,55 @@ class AFConfig:
     hill_step: float = 0.08
     hill_min_step: float = 0.004
     hill_patience: int = 2
+
+
+# -----------------------------------------------------------------------------
+# 时域策略（AE / AWB 共用）
+#
+# 语义边界：AEConfig/AWBConfig 管**控制律**（怎么算这一步），TemporalConfig 管
+# **时域策略**（怎么用历史）。分开是因为 AEConfig 会被 cli 原地改写、被实验
+# deepcopy 后逐实验改，把 15 个时域字段塞进去会让 sweep 实验的对比变量不纯。
+#
+# 注意：这里只放参数。滤波器的内部状态（上一帧的平滑值等）**必须挂在控制器
+# 实例上**，不能挂配置对象 —— 否则 copy.deepcopy(cfg) 会把陈旧状态一起复制，
+# 时序语义直接错乱（同 ISPPipeline.last_lsc_map 的范式）。
+# -----------------------------------------------------------------------------
+@dataclass
+class TemporalConfig:
+    # --- 测光量时域滤波 ---
+    enable: bool = False            # 默认关：关闭时既有实验数值逐位不变
+    domain: str = "log2_metric"     # 作用在测光量上（不是 EV 指令上）
+    alpha_fast: float = 0.90        # 收敛期 / 场景切换后（越小越平滑）
+    alpha_slow: float = 0.20        # 稳态
+    adaptive: bool = True           # 按误差大小在 fast/slow 之间切换
+    conv_band_ev: float = 0.30      # |误差| 超过它就退化为 fast
+    # 过曝旁路：饱和是无噪声的硬信号，滤波会在 1~2 帧内把它稀释掉，
+    # 从而延迟退曝光（放大"越曝越看不出来"那个坑）。过曝比例超限时该帧不滤波。
+    clip_bypass_ratio: float = 0.02
+    ev_slew_ev_per_frame: float = 0.0   # 可选的 EV 二次限速，0 = 关
+
+    # --- 场景切换检测 ---
+    cut_enable: bool = True
+    # 三个信号的门限。默认值已由实测标定（192x144，3 seed x 2 起始 EV）：
+    #   静止最坏（54 组条件，0 误触发）: dM=0.026 tex=0.072 hist=0.063
+    #   真实切换最小（5 类事件，0 帧延迟）: dM=1.998 tex=0.000 hist=0.584
+    # 门限落在两侧中间，满足 plan 的判据「门限 < 0.5 x 切换最小值」。
+    # 换分辨率/场景集后需重新标定（见 experiments.exp_scene_cut）。
+    cut_metric_ev: float = 0.35     # 曝光归一化测光量的 log2 跳变
+    cut_texture_ratio: float = 0.50  # 结构信号（锐度）比值跳变
+    cut_hist_dist: float = 0.25     # 曝光归一化亮度直方图距离
+    # 注意 texture_ratio 单独不可靠：匀光板几乎没有纹理，结构信号被噪声主导，
+    # 实测其**静止**值(0.047)可以高于该场景切换时的值(0.012)。它只能做投票里的
+    # 辅助票 —— 真正稳的是 d_metric_ev 与 hist_dist，二者在所有场景下都能各自过阈。
+    cut_votes: int = 2              # 至少几个信号超阈才判切换（单信号噪声无法触发）
+    cut_refractory: int = 4         # 触发后的不应期帧数
+    ref_alpha: float = 0.05         # 检测器参考量的慢 EMA 系数
+    cut_angle_deg: float = 8.0      # AWB：光源估计角度变化超过它则重置而非抹平
+    fast_frames_after_cut: int = 3  # 检出切换后强制走 alpha_fast 的帧数
+
+    # --- 评价口径 ---
+    settle_thresh_ev: float = 0.05  # |误差| 低于它算稳
+    settle_hold: int = 3            # 连续这么多帧才算重收敛
 
 
 # -----------------------------------------------------------------------------
